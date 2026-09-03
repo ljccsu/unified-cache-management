@@ -23,6 +23,7 @@
  * */
 #include "trans_buffer.h"
 #include <atomic>
+#include <cstring>
 #include <filesystem>
 #include <thread>
 #include <unistd.h>
@@ -91,9 +92,10 @@ public:
     virtual void NodeLock(size_t iNode) = 0;
     virtual void NodeUnlock(size_t iNode) = 0;
     virtual size_t& FirstAt(size_t iBucket) = 0;
-    virtual size_t FetchNode(bool allowReserved) = 0;
+    virtual size_t FetchNode(bool allowReserved, size_t preferredSegment, size_t attempt) = 0;
     virtual void* DataAt(size_t iNode) = 0;
     virtual void* DeviceDataAt(size_t iNode) = 0;
+    virtual size_t SegmentAt(size_t iNode) const = 0;
     virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
     virtual void MarkAccessed(size_t iNode) = 0;
 };
@@ -219,7 +221,7 @@ public:
     void NodeLock(size_t iNode) override { nodeLocks_[iNode].Lock(); }
     void NodeUnlock(size_t iNode) override { nodeLocks_[iNode].Unlock(); }
     size_t& FirstAt(size_t iBucket) override { return header_.buckets[iBucket]; }
-    size_t FetchNode(bool allowReserved) override
+    size_t FetchNode(bool allowReserved, size_t /*preferredSegment*/, size_t /*attempt*/) override
     {
         const auto total = header_.nNode - (allowReserved ? 0 : base_.reservedNumber);
         for (size_t i = 0; i < 2 * total; ++i) {
@@ -234,18 +236,15 @@ public:
         return header_.nodeCursor++ % total;
     }
     void MarkAccessed(size_t iNode) override
-    {
-        accessed_[iNode].store(1, std::memory_order_relaxed);
-    }
+    { accessed_[iNode].store(1, std::memory_order_relaxed); }
     void* DataAt(size_t iNode) override
-    {
-        return ((std::byte*)data_.get()) + header_.nodeSize * iNode;
-    }
+    { return ((std::byte*)data_.get()) + header_.nodeSize * iNode; }
     void* DeviceDataAt(size_t iNode) override
     {
         if (dataOnDevice_ == nullptr) { return nullptr; }
         return dataOnDevice_ + header_.nodeSize * iNode;
     }
+    size_t SegmentAt(size_t /*iNode*/) const override { return 0; }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_.get() + iNode; }
 };
 
@@ -276,10 +275,14 @@ protected:
         bool TryLock() { return pthread_spin_trylock(&lock) == 0; }
         void Unlock() { pthread_spin_unlock(&lock); }
     };
-    static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 2);
+    static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 3);
+    enum class SharedLayout : size_t { SINGLE = 0, RANK_STRIPED = 1 };
     struct BufferHeader {
         std::atomic<size_t> magic;
         size_t nNode;
+        size_t segmentCount;
+        size_t nodesPerSegment;
+        SharedLayout layout;
         alignas(64) std::atomic<size_t> nodeCursor;
         char nodeCursorPad[64 - sizeof(std::atomic<size_t>)];
         size_t buckets[nHashTableBucket];
@@ -292,12 +295,17 @@ protected:
     BufferHeader* header_{nullptr};
     BufferMetaNode* meta_{nullptr};
     std::atomic<uint8_t>* accessed_{nullptr};
+    std::atomic<size_t>* segmentCursors_{nullptr};
+    std::atomic<uint8_t>* segmentReady_{nullptr};
     std::byte* data_{nullptr};
     std::byte* dataOnDevice_{nullptr};
     const std::string& uuid_;
     std::string shmName_;
     size_t nodeSize_{0};
     size_t nNode_{0};
+    size_t segmentCount_{1};
+    size_t nodesPerSegment_{0};
+    SharedLayout layout_{SharedLayout::SINGLE};
     void* addrress_{nullptr};
     size_t totalSize_{0};
 
@@ -308,10 +316,26 @@ protected:
         return (off + align - 1) & ~(align - 1);
     }
     size_t AccessedSize() const noexcept { return sizeof(std::atomic<uint8_t>) * nNode_; }
+    size_t SegmentCursorsOffset() const noexcept
+    {
+        constexpr auto align = alignof(std::atomic<size_t>);
+        auto off = AccessedOffset() + AccessedSize();
+        return (off + align - 1) & ~(align - 1);
+    }
+    size_t SegmentCursorsSize() const noexcept
+    { return sizeof(std::atomic<size_t>) * segmentCount_; }
+    size_t SegmentReadyOffset() const noexcept
+    {
+        auto off = SegmentCursorsOffset() + SegmentCursorsSize();
+        constexpr auto align = alignof(std::atomic<uint8_t>);
+        return (off + align - 1) & ~(align - 1);
+    }
+    size_t SegmentReadySize() const noexcept
+    { return sizeof(std::atomic<uint8_t>) * segmentCount_; }
     size_t MetaOffset() const noexcept
     {
         constexpr auto align = alignof(BufferMetaNode);
-        auto off = AccessedOffset() + AccessedSize();
+        auto off = SegmentReadyOffset() + SegmentReadySize();
         return (off + align - 1) & ~(align - 1);
     }
     size_t DataOffset() const noexcept
@@ -321,6 +345,14 @@ protected:
         return (size + pageSize - 1) & ~(pageSize - 1);
     }
     size_t DataSize() const noexcept { return nodeSize_ * nNode_; }
+    void InitPointers() noexcept
+    {
+        auto base = static_cast<std::byte*>(addrress_);
+        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(base + AccessedOffset());
+        segmentCursors_ = reinterpret_cast<std::atomic<size_t>*>(base + SegmentCursorsOffset());
+        segmentReady_ = reinterpret_cast<std::atomic<uint8_t>*>(base + SegmentReadyOffset());
+        meta_ = reinterpret_cast<BufferMetaNode*>(base + MetaOffset());
+    }
     static const std::string& ShmPrefix() noexcept
     {
         static std::string prefix{"uc_shm_cache_"};
@@ -341,6 +373,10 @@ protected:
                 name == me) {
                 continue;
             }
+            // Rank-striped payload is split across sibling files. A legacy cleanup scan cannot
+            // tell whether those siblings still belong to a live mapping, so only their exact
+            // owner lifecycle may unlink them.
+            if (name.find("_rs_") != std::string::npos) { continue; }
             try {
                 const auto lwt = fs::last_write_time(path);
                 if (now - lwt <= keepThreshold) { continue; }
@@ -350,7 +386,7 @@ protected:
         }
     }
     static Status MmapShmFile(PosixShm& shmFile, const size_t size, void*& addr,
-                              bool needTrunc = true)
+                              bool needTrunc = true, bool populate = true)
     {
         auto s = Status::OK();
         if (needTrunc) {
@@ -360,7 +396,7 @@ protected:
                 return s;
             }
         }
-        s = shmFile.MMap(addr, size, true, true, true, true);
+        s = shmFile.MMap(addr, size, true, true, true, populate);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to mmap file({}) with size({}).", s, shmFile.ShmName(), size);
             return s;
@@ -385,11 +421,16 @@ protected:
         auto s = MmapShmFile(shmFile, totalSize_, addrress_);
         if (s.Failure()) [[unlikely]] { return s; }
         header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        InitPointers();
         header_->nNode = nNode_;
+        header_->segmentCount = segmentCount_;
+        header_->nodesPerSegment = nodesPerSegment_;
+        header_->layout = layout_;
         header_->nodeCursor.store(0, std::memory_order_relaxed);
+        for (size_t i = 0; i < segmentCount_; i++) {
+            segmentCursors_[i].store(0, std::memory_order_relaxed);
+            segmentReady_[i].store(0, std::memory_order_relaxed);
+        }
         for (size_t i = 0; i < nHashTableBucket; i++) {
             header_->buckets[i] = invalidIndex;
             header_->bucketLocks[i].Init();
@@ -417,9 +458,14 @@ protected:
             UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
             return s;
         }
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        if (header_->nNode != nNode_ || header_->segmentCount != segmentCount_ ||
+            header_->nodesPerSegment != nodesPerSegment_ || header_->layout != layout_) {
+            return Status::InvalidParam(
+                "shared buffer layout mismatch: nodes={}/{}, segments={}/{}, perSegment={}/{}",
+                nNode_, header_->nNode, segmentCount_, header_->segmentCount, nodesPerSegment_,
+                header_->nodesPerSegment);
+        }
+        InitPointers();
         return Status::OK();
     }
     Status RegisterBuffer(int32_t deviceId)
@@ -461,6 +507,8 @@ public:
         shmName_ = ShmPrefix() + uuid;
         nodeSize_ = nodeSize;
         nNode_ = totalSize / nodeSize;
+        segmentCount_ = 1;
+        nodesPerSegment_ = nNode_;
         CleanUpShmFileExceptMe(shmName_);
         PosixShm shmFile{shmName_};
         const auto dataOffset = DataOffset();
@@ -484,7 +532,7 @@ public:
     void NodeLock(size_t iNode) override { header_->nodeLocks[iNode].Lock(); }
     void NodeUnlock(size_t iNode) override { header_->nodeLocks[iNode].Unlock(); }
     size_t& FirstAt(size_t iBucket) override { return header_->buckets[iBucket]; }
-    size_t FetchNode(bool allowReserved) override
+    size_t FetchNode(bool allowReserved, size_t /*preferredSegment*/, size_t /*attempt*/) override
     {
         const auto total = header_->nNode - (allowReserved ? 0 : base_.reservedNumber);
         for (size_t i = 0; i < 2 * total; ++i) {
@@ -499,24 +547,254 @@ public:
         return header_->nodeCursor.fetch_add(1, std::memory_order_relaxed) % total;
     }
     void MarkAccessed(size_t iNode) override
-    {
-        accessed_[iNode].store(1, std::memory_order_relaxed);
-    }
+    { accessed_[iNode].store(1, std::memory_order_relaxed); }
     void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
     void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
+    size_t SegmentAt(size_t /*iNode*/) const override { return 0; }
     BufferMetaNode* MetaAt(size_t iNode) override { return meta_ + iNode; }
+};
+
+class RankStripedSharedBufferStrategy : public SharedBufferStrategy {
+    size_t timeoutMs_{0};
+    size_t segmentSize_{0};
+    std::vector<std::string> dataShmNames_{};
+    std::vector<std::byte*> dataBases_{};
+    std::vector<std::byte*> dataOnDeviceBases_{};
+    std::vector<uint8_t> registered_{};
+
+    Status WaitSegmentReady(size_t segment) const
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
+        while (segmentReady_[segment].load(std::memory_order_acquire) == 0) {
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Status::Error(
+                    fmt::format("rank-striped shared buffer segment({}) not ready", segment));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+        return Status::OK();
+    }
+
+    Status WaitAllSegmentsReady() const
+    {
+        for (size_t segment = 0; segment < segmentCount_; ++segment) {
+            auto s = WaitSegmentReady(segment);
+            if (s.Failure()) { return s; }
+        }
+        return Status::OK();
+    }
+
+    Status MapOwnedSegment(size_t segment)
+    {
+        PosixShm shmFile{dataShmNames_[segment]};
+        const auto flags =
+            PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
+        auto s = shmFile.ShmOpen(flags);
+        if (s.Success()) {
+            void* addr = nullptr;
+            s = MmapShmFile(shmFile, segmentSize_, addr, true, true);
+            if (s.Failure()) { return s; }
+            dataBases_[segment] = static_cast<std::byte*>(addr);
+            std::memset(dataBases_[segment], 0, segmentSize_);
+            segmentReady_[segment].store(1, std::memory_order_release);
+            UC_INFO("Created rank-striped shared buffer segment({}) file({}) size({}).", segment,
+                    dataShmNames_[segment], segmentSize_);
+            return Status::OK();
+        }
+        if (s != Status::DuplicateKey()) {
+            UC_ERROR("Failed({}) to create rank-striped file({}).", s, dataShmNames_[segment]);
+            return s;
+        }
+        s = WaitSegmentReady(segment);
+        if (s.Failure()) { return s; }
+        s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
+        if (s.Failure()) { return s; }
+        void* addr = nullptr;
+        s = MmapShmFile(shmFile, segmentSize_, addr, false, false);
+        if (s.Success()) { dataBases_[segment] = static_cast<std::byte*>(addr); }
+        return s;
+    }
+
+    Status MapPeerSegment(size_t segment)
+    {
+        PosixShm shmFile{dataShmNames_[segment]};
+        auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to open rank-striped file({}).", s, dataShmNames_[segment]);
+            return s;
+        }
+        void* addr = nullptr;
+        s = MmapShmFile(shmFile, segmentSize_, addr, false, false);
+        if (s.Success()) { dataBases_[segment] = static_cast<std::byte*>(addr); }
+        return s;
+    }
+
+    Status RegisterSegments(int32_t deviceId)
+    {
+        for (size_t segment = 0; segment < segmentCount_; ++segment) {
+            void* deviceData = nullptr;
+            auto s =
+                Trans::Buffer::RegisterHostBuffer(dataBases_[segment], segmentSize_, &deviceData);
+            if (s.Failure()) {
+                UC_ERROR("Failed({}) to register rank-striped segment({}) to device({}).", s,
+                         segment, deviceId);
+                return s;
+            }
+            dataOnDeviceBases_[segment] = static_cast<std::byte*>(deviceData);
+            registered_[segment] = 1;
+            UC_DEBUG("Registered rank-striped segment({}) host({}) device({}) on device({}).",
+                     segment, fmt::ptr(dataBases_[segment]), fmt::ptr(deviceData), deviceId);
+        }
+        return Status::OK();
+    }
+
+public:
+    RankStripedSharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
+                                    size_t totalSize, size_t reservedNumber, size_t localRankSize,
+                                    size_t timeoutMs)
+        : SharedBufferStrategy(uuid, deviceId, nodeSize, totalSize, reservedNumber),
+          timeoutMs_(timeoutMs)
+    {
+        segmentCount_ = localRankSize;
+        layout_ = SharedLayout::RANK_STRIPED;
+    }
+    ~RankStripedSharedBufferStrategy() override
+    {
+        for (size_t segment = 0; segment < dataBases_.size(); ++segment) {
+            if (registered_[segment]) { Trans::Buffer::UnregisterHostBuffer(dataBases_[segment]); }
+            if (dataBases_[segment]) { PosixShm::MUnmap(dataBases_[segment], segmentSize_); }
+        }
+        for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
+    }
+    Status Setup() override
+    {
+        const auto deviceId = base_.deviceId;
+        if (base_.nodeSize == 0 || segmentCount_ == 0 || deviceId < 0 ||
+            static_cast<size_t>(deviceId) >= segmentCount_) {
+            return Status::InvalidParam("invalid rank-striped shared buffer layout");
+        }
+        const auto nodeCount = base_.totalSize / base_.nodeSize;
+        if (base_.reservedNumber % segmentCount_ != 0 ||
+            nodeCount / segmentCount_ <= base_.reservedNumber / segmentCount_) {
+            return Status::InvalidParam(
+                "rank-striped nodes({}) or reserved nodes({}) cannot be split across {} ranks",
+                nodeCount, base_.reservedNumber, segmentCount_);
+        }
+        Trans::Device device;
+        auto s = device.Setup(deviceId);
+        if (s.Failure()) {
+            UC_ERROR("Failed({}) to setup device({}) for rank-striped shared buffer.", s, deviceId);
+            return s;
+        }
+
+        nodeSize_ = base_.nodeSize;
+        nodesPerSegment_ = nodeCount / segmentCount_;
+        nNode_ = nodesPerSegment_ * segmentCount_;
+        segmentSize_ = nodeSize_ * nodesPerSegment_;
+        UC_INFO(
+            "Setting up rank-striped shared buffer: rank={}, segments={}, nodesPerSegment={}, "
+            "segmentSize={}.",
+            deviceId, segmentCount_, nodesPerSegment_, segmentSize_);
+        const auto unusedBytes = base_.totalSize - segmentSize_ * segmentCount_;
+        if (unusedBytes > 0) {
+            UC_INFO("Rank-striped shared buffer leaves {} tail bytes unused for equal segments.",
+                    unusedBytes);
+        }
+        shmName_ = ShmPrefix() + uuid_ + "_rs_meta";
+        dataShmNames_.reserve(segmentCount_);
+        for (size_t segment = 0; segment < segmentCount_; ++segment) {
+            dataShmNames_.push_back(ShmPrefix() + uuid_ + "_rs_data_" + std::to_string(segment));
+        }
+        dataBases_.assign(segmentCount_, nullptr);
+        dataOnDeviceBases_.assign(segmentCount_, nullptr);
+        registered_.assign(segmentCount_, 0);
+        totalSize_ = DataOffset();
+
+        PosixShm metaFile{shmName_};
+        const auto flags =
+            PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
+        s = metaFile.ShmOpen(flags);
+        if (s.Success()) {
+            for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
+            CleanUpShmFileExceptMe(shmName_);
+            s = InitShmBuffer(metaFile);
+        } else if (s == Status::DuplicateKey()) {
+            s = LoadShmBuffer(metaFile);
+        } else {
+            UC_ERROR("Failed({}) to open rank-striped meta file({}).", s, shmName_);
+            return s;
+        }
+        if (s.Failure()) { return s; }
+        if (header_->layout != SharedLayout::RANK_STRIPED) {
+            return Status::InvalidParam("shared buffer({}) is not rank-striped", shmName_);
+        }
+
+        const auto localRank = static_cast<size_t>(deviceId);
+        s = MapOwnedSegment(localRank);
+        if (s.Failure()) { return s; }
+        s = WaitAllSegmentsReady();
+        if (s.Failure()) { return s; }
+        for (size_t segment = 0; segment < segmentCount_; ++segment) {
+            if (segment == localRank) { continue; }
+            s = MapPeerSegment(segment);
+            if (s.Failure()) { return s; }
+        }
+        return RegisterSegments(deviceId);
+    }
+    size_t FetchNode(bool allowReserved, size_t preferredSegment, size_t attempt) override
+    {
+        const auto reservedPerSegment = base_.reservedNumber / segmentCount_;
+        const auto total = nodesPerSegment_ - (allowReserved ? 0 : reservedPerSegment);
+        size_t segment = 0;
+        if (preferredSegment < segmentCount_) {
+            // Exhaust candidates in the preferred segment before falling back to the next one.
+            // A single busy node must not make an otherwise non-full preferred segment spill.
+            segment = (preferredSegment + attempt / total) % segmentCount_;
+        } else {
+            segment = header_->nodeCursor.fetch_add(1, std::memory_order_relaxed) % segmentCount_;
+        }
+        for (size_t i = 0; i < 2 * total; ++i) {
+            const auto local =
+                segmentCursors_[segment].fetch_add(1, std::memory_order_relaxed) % total;
+            const auto cur = segment * nodesPerSegment_ + local;
+            uint8_t expected = 1;
+            if (accessed_[cur].compare_exchange_strong(expected, 0, std::memory_order_relaxed,
+                                                       std::memory_order_relaxed)) {
+                continue;
+            }
+            return cur;
+        }
+        const auto local = segmentCursors_[segment].fetch_add(1, std::memory_order_relaxed) % total;
+        return segment * nodesPerSegment_ + local;
+    }
+    void* DataAt(size_t iNode) override
+    {
+        const auto segment = SegmentAt(iNode);
+        const auto local = iNode % nodesPerSegment_;
+        return dataBases_[segment] + nodeSize_ * local;
+    }
+    void* DeviceDataAt(size_t iNode) override
+    {
+        const auto segment = SegmentAt(iNode);
+        const auto local = iNode % nodesPerSegment_;
+        return dataOnDeviceBases_[segment] + nodeSize_ * local;
+    }
+    size_t SegmentAt(size_t iNode) const override { return iNode / nodesPerSegment_; }
 };
 
 class SharedBufferWatcherStrategy : public SharedBufferStrategy {
 public:
-    explicit SharedBufferWatcherStrategy(const std::string& uuid)
+    SharedBufferWatcherStrategy(const std::string& uuid, bool rankStriped)
         : SharedBufferStrategy(uuid, -1, 0, 0, 0)
-    {
-    }
+    { layout_ = rankStriped ? SharedLayout::RANK_STRIPED : SharedLayout::SINGLE; }
     Status Setup() override
     {
         shmName_ = ShmPrefix() + uuid_;
-        CleanUpShmFileExceptMe(shmName_);
+        if (layout_ == SharedLayout::RANK_STRIPED) { shmName_ += "_rs_meta"; }
+        // In the rank-striped layout, the sibling data files are live payload segments and must
+        // not be removed by the legacy single-file cleanup scan.
+        if (layout_ == SharedLayout::SINGLE) { CleanUpShmFileExceptMe(shmName_); }
         PosixShm shmFile{shmName_};
         auto s = shmFile.ShmOpen(PosixShm::OpenFlag::READ_WRITE);
         if (s.Failure()) {
@@ -533,15 +811,19 @@ public:
             UC_ERROR("Shm file({}) not ready.", shmFile.ShmName());
             return s;
         }
+        if (header->layout != layout_) {
+            shmFile.MUnmap(addr, size);
+            return Status::InvalidParam("shared buffer({}) layout mismatch", shmName_);
+        }
         nNode_ = header->nNode;
+        segmentCount_ = header->segmentCount;
+        nodesPerSegment_ = header->nodesPerSegment;
         shmFile.MUnmap(addr, size);
         totalSize_ = DataOffset();
         s = MmapShmFile(shmFile, totalSize_, addrress_, false);
         if (s.Failure()) [[unlikely]] { return s; }
         header_ = static_cast<BufferHeader*>(addrress_);
-        meta_ = (BufferMetaNode*)(static_cast<std::byte*>(addrress_) + MetaOffset());
-        accessed_ = reinterpret_cast<std::atomic<uint8_t>*>(static_cast<std::byte*>(addrress_) +
-                                                            AccessedOffset());
+        InitPointers();
         return Status::OK();
     }
     void* DataAt(size_t iNode) override { return nullptr; }
@@ -558,11 +840,18 @@ Status TransBuffer::Setup(const Config& config)
                 config.deviceId, config.shardSize, config.bufferCapacity,
                 config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect);
         } else if (config.deviceId >= 0) {
-            strategy_ = std::make_shared<SharedBufferStrategy>(
-                config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
-                config.loadExclusiveBufferNumber);
+            if (config.shareBufferRankStriped) {
+                strategy_ = std::make_shared<RankStripedSharedBufferStrategy>(
+                    config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
+                    config.loadExclusiveBufferNumber, config.localRankSize, config.timeoutMs);
+            } else {
+                strategy_ = std::make_shared<SharedBufferStrategy>(
+                    config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
+                    config.loadExclusiveBufferNumber);
+            }
         } else {
-            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(config.uniqueId);
+            strategy_ = std::make_shared<SharedBufferWatcherStrategy>(
+                config.uniqueId, config.shareBufferRankStriped);
         }
     } catch (const std::exception& e) {
         return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
@@ -571,7 +860,7 @@ Status TransBuffer::Setup(const Config& config)
 }
 
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
-                                     bool allowReserved, bool isLoad)
+                                     bool allowReserved, bool isLoad, size_t preferredSegment)
 {
     auto iBucket = Hash(blockId, shardIdx);
     bool owner = false;
@@ -582,17 +871,18 @@ TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shar
         strategy_->BucketUnlock(iBucket);
         return Handle{this, iNode, owner};
     }
-    iNode = Alloc(blockId, shardIdx, iBucket, allowReserved);
+    iNode = Alloc(blockId, shardIdx, iBucket, allowReserved, preferredSegment);
     strategy_->BucketUnlock(iBucket);
     return Handle(this, iNode, true);
 }
 
-void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved)
+void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved,
+                           size_t preferredSegment)
 {
     auto iBucket = Hash(blockId, shardIdx);
     strategy_->BucketLock(iBucket);
     if (!ExistAt(iBucket, blockId, shardIdx)) {
-        size_t pos = Alloc(blockId, shardIdx, iBucket, allowReserved);
+        size_t pos = Alloc(blockId, shardIdx, iBucket, allowReserved, preferredSegment);
         Release(pos);
     }
     strategy_->BucketUnlock(iBucket);
@@ -642,10 +932,11 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
 }
 
 size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
-                          bool allowReserved)
+                          bool allowReserved, size_t preferredSegment)
 {
+    size_t attempt = 0;
     for (;;) {
-        auto iNode = strategy_->FetchNode(allowReserved);
+        auto iNode = strategy_->FetchNode(allowReserved, preferredSegment, attempt++);
         auto meta = strategy_->MetaAt(iNode);
         strategy_->NodeLock(iNode);
         if (meta->reference > 0) {
@@ -717,6 +1008,8 @@ void* TransBuffer::DataAt(Index pos) { return strategy_->DataAt(pos); }
 
 void* TransBuffer::DeviceDataAt(Index pos) { return strategy_->DeviceDataAt(pos); }
 
+size_t TransBuffer::SegmentAt(Index pos) const { return strategy_->SegmentAt(pos); }
+
 void TransBuffer::Acquire(Index pos)
 {
     strategy_->NodeLock(pos);
@@ -734,9 +1027,7 @@ void TransBuffer::Release(Index pos)
 bool TransBuffer::Ready(Index pos) { return GetState(pos) == State::READY; }
 
 TransBuffer::State TransBuffer::GetState(Index pos)
-{
-    return strategy_->MetaAt(pos)->state.load(std::memory_order_acquire);
-}
+{ return strategy_->MetaAt(pos)->state.load(std::memory_order_acquire); }
 
 Status TransBuffer::FailureStatus(Index pos)
 {
@@ -748,9 +1039,7 @@ Status TransBuffer::FailureStatus(Index pos)
 }
 
 void TransBuffer::MarkReady(Index pos)
-{
-    strategy_->MetaAt(pos)->state.store(State::READY, std::memory_order_release);
-}
+{ strategy_->MetaAt(pos)->state.store(State::READY, std::memory_order_release); }
 
 void TransBuffer::MarkFailed(Index pos, const Status& status)
 {

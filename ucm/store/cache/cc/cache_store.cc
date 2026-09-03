@@ -96,9 +96,7 @@ public:
         return res;
     }
     void Prefetch(const Detail::BlockId* blocks, size_t num) override
-    {
-        bufferMgr_.Prefetch(blocks, num);
-    }
+    { bufferMgr_.Prefetch(blocks, num); }
     Expected<Detail::TaskHandle> Load(Detail::TaskDesc task) override
     {
         if (!transEnable_) { return Status::Error("transfer is not enable"); }
@@ -152,6 +150,7 @@ private:
         config.Get("cpu_affinity_cores", param.cpuAffinityCores);
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
+        config.Get("share_buffer_rank_striped", param.shareBufferRankStriped);
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
         size_t bufferCapacityGb = 0;
@@ -192,6 +191,13 @@ private:
             return Status::InvalidParam("invalid device({})", config.deviceId);
         }
         if (config.uniqueId.empty()) { return Status::InvalidParam("invalid unique id"); }
+        if (config.shareBufferRankStriped && !config.shareBufferEnable) {
+            return Status::InvalidParam(
+                "rank-striped shared buffer requires share_buffer_enable=true");
+        }
+        if (config.shareBufferRankStriped && config.localRankSize == 0) {
+            return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
+        }
         auto s =
             Trans::GdrKVBufferConfig::Validate(config.gpuKvBufferAddrs, config.gpuKvBufferSizes);
         if (s.Failure()) { return s; }
@@ -231,6 +237,17 @@ private:
         if (config.localRankSize == 0) {
             return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
         }
+        if (config.shareBufferRankStriped) {
+            if (static_cast<size_t>(config.deviceId) >= config.localRankSize) {
+                return Status::InvalidParam("device({}) must be a local rank smaller than {}",
+                                            config.deviceId, config.localRankSize);
+            }
+            if (config.loadExclusiveBufferNumber % config.localRankSize != 0) {
+                return Status::InvalidParam(
+                    "exclusive buffer number({}) must be divisible by local rank size({})",
+                    config.loadExclusiveBufferNumber, config.localRankSize);
+            }
+        }
         return Status::OK();
     }
     void ShowConfig(const Config& config)
@@ -257,6 +274,7 @@ private:
         UC_INFO("Set {}::CpuAffinityCores to {}.", ns, config.cpuAffinityCores);
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
+        UC_INFO("Set {}::ShareBufferRankStriped to {}.", ns, config.shareBufferRankStriped);
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
         if (config.cacheIOAggregation) {
             UC_INFO("Set {}::AggregationObject to CacheStoreShard.", ns);

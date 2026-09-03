@@ -86,6 +86,11 @@ public:
             if (Valid()) { return buf_->DeviceDataAt(pos_); }
             return nullptr;
         }
+        size_t Segment() const
+        {
+            if (Valid()) { return buf_->SegmentAt(pos_); }
+            return 0;
+        }
         bool Ready() const { return buf_->Ready(pos_); };
         State GetState() const { return buf_->GetState(pos_); }
         Status FailureStatus() const { return buf_->FailureStatus(pos_); }
@@ -110,19 +115,21 @@ public:
 public:
     Status Setup(const Config& config);
     Handle Get(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
-               bool isLoad = false);
-    void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false);
+               bool isLoad = false, size_t preferredSegment = npos);
+    void Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool allowReserved = false,
+                  size_t preferredSegment = npos);
     bool Exist(const Detail::BlockId& blockId, size_t shardIdx);
 
 private:
     bool ExistAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx);
     size_t FindAt(size_t iBucket, const Detail::BlockId& blockId, size_t shardIdx, bool& owner);
     size_t Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_t iBucket,
-                 bool allowReserved = false);
+                 bool allowReserved = false, size_t preferredSegment = npos);
     void MoveTo(size_t iBucket, size_t iNode);
     void Remove(size_t iBucket, size_t iNode);
     void* DataAt(Index pos);
     void* DeviceDataAt(Index pos);
+    size_t SegmentAt(Index pos) const;
     void Acquire(Index pos);
     void Release(Index pos);
     bool Ready(Index pos);

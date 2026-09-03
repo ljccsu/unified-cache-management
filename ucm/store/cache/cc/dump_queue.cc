@@ -49,6 +49,8 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
     cacheSdmaDirect_ = config.cacheSdmaDirect;
+    rankStriped_ = config.shareBufferRankStriped;
+    localRankSize_ = config.localRankSize;
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
@@ -111,6 +113,21 @@ void DumpQueue::DispatchOneTask(CopyStream& stream, TaskPair&& pair)
     waiter->Done();
 }
 
+static std::vector<size_t> RearrangeIndex(size_t n, size_t iProc, size_t nProc)
+{
+    std::vector<size_t> order;
+    order.reserve(n);
+    for (size_t r = 0; r < nProc; ++r) {
+        const auto slice = (iProc + r) % nProc;
+        for (size_t j = 0;; ++j) {
+            const auto i = slice + j * nProc;
+            if (i >= n) { break; }
+            order.push_back(i);
+        }
+    }
+    return order;
+}
+
 Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
 {
     auto dumpStartTp = NowTime::Now();
@@ -135,9 +152,16 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
         if (cbStatus.Failure()) [[unlikely]] { eventReadyTp.reset(); }
     }
     size_t copiedShards = 0;
+    std::vector<size_t> indexes;
+    if (rankStriped_) {
+        indexes = RearrangeIndex(nShard, static_cast<size_t>(deviceId_), localRankSize_);
+    }
     for (size_t i = 0; i < nShard; i++) {
-        auto& shard = task->desc[i];
-        auto handle = buffer_->Get(shard.owner, shard.index);
+        const auto originalIndex = rankStriped_ ? indexes[i] : i;
+        auto& shard = task->desc[originalIndex];
+        auto handle = rankStriped_ ? buffer_->Get(shard.owner, shard.index, false, false,
+                                                  originalIndex % localRankSize_)
+                                   : buffer_->Get(shard.owner, shard.index);
         if (!handle.Owner()) { continue; }
         if (!handle.Ready()) {
             auto* host = cacheSdmaDirect_ ? handle.DeviceData() : handle.Data();
@@ -202,9 +226,7 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
 }
 
 Status DumpQueue::DeviceToHostAsync(CopyStream& stream, void** device, void* host)
-{
-    return stream.DeviceToHostAsync(device, host, tensorSizes_);
-}
+{ return stream.DeviceToHostAsync(device, host, tensorSizes_); }
 
 void DumpQueue::BackendDumpStage()
 {

@@ -47,6 +47,7 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     useGdr_ = config.useGdr;
     cacheIOAggregation_ = config.cacheIOAggregation;
     cacheSdmaDirect_ = config.cacheSdmaDirect;
+    rankStriped_ = config.shareBufferRankStriped;
     cpuAffinityCores_ = config.cpuAffinityCores;
     localRankSize_ = config.localRankSize;
     waiting_.Setup(config.waitingQueueDepth);
@@ -113,10 +114,27 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     size_t backendSubmitCount = 0;
     size_t waitShardCount = 0;
     const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
+    struct PreallocHint {
+        Detail::BlockId block;
+        size_t shard;
+        size_t segment;
+    };
+    std::vector<PreallocHint> preallocHints;
+    preallocHints.reserve(nShard);
+    std::vector<std::vector<ShardTask>> segmentBuckets;
+    if (rankStriped_) { segmentBuckets.resize(localRankSize_); }
+    size_t placementMismatchCount = 0;
     for (size_t i = 0; i < nShard; i++) {
-        auto& shard = task->desc[indexes[i]];
+        const auto originalIndex = indexes[i];
+        auto& shard = task->desc[originalIndex];
         ShardTask shardTask;
-        shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
+        if (rankStriped_) {
+            const auto preferredSegment = originalIndex % localRankSize_;
+            shardTask.bufferHandle =
+                buffer_->Get(shard.owner, shard.index, true, true, preferredSegment);
+        } else {
+            shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
+        }
         shardTask.backendTaskHandle = 0;
         shardTask.fromPosix = !shardTask.bufferHandle.Ready();
         if (shardTask.fromPosix) { waitShardCount++; }
@@ -131,7 +149,21 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                 UC::Metrics::UpdateStats(
                     NAME_TO_METRIC_ID("cache_backend_load_submit_errors_total"), 1.0);
                 RecordLoadSourceShards(i + 1, waitShardCount);
-                RecordFailedShards(nShard - i);
+                RecordFailedShards(rankStriped_ ? nShard : nShard - i);
+                if (rankStriped_) {
+                    for (auto& bucket : segmentBuckets) {
+                        for (auto& pending : bucket) {
+                            if (pending.backendTaskHandle != 0) {
+                                auto waitStatus = backend_->Wait(pending.backendTaskHandle);
+                                if (waitStatus.Success()) {
+                                    pending.bufferHandle.MarkReady();
+                                } else {
+                                    pending.bufferHandle.MarkFailed(waitStatus);
+                                }
+                            }
+                        }
+                    }
+                }
                 shardTask.bufferHandle.MarkFailed(res.Error());
                 task->Fail(res.Error());
                 failureSet_->Insert(task->id);
@@ -141,16 +173,42 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
             shardTask.backendTaskHandle = res.Value();
             backendSubmitCount++;
         }
+        const auto actualSegment = shardTask.bufferHandle.Segment();
+        if (rankStriped_ && actualSegment != originalIndex % localRankSize_) {
+            ++placementMismatchCount;
+        }
+        if (shard.index + 1 != nShardPerBlock_) {
+            preallocHints.push_back({shard.owner, shard.index + 1, actualSegment});
+        }
         shardTask.task = task;
         shardTask.shard = std::move(shard);
-        shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
-        running_.Push(std::move(shardTask));
+        if (rankStriped_) {
+            segmentBuckets[actualSegment].push_back(std::move(shardTask));
+        } else {
+            shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+            running_.Push(std::move(shardTask));
+        }
+    }
+    if (rankStriped_) {
+        std::vector<size_t> segmentCounts(localRankSize_);
+        size_t pushed = 0;
+        for (size_t phase = 0; phase < localRankSize_; ++phase) {
+            const auto segment = (static_cast<size_t>(deviceId_) + phase) % localRankSize_;
+            segmentCounts[segment] = segmentBuckets[segment].size();
+            for (auto& shardTask : segmentBuckets[segment]) {
+                shardTask.waiter = (++pushed == nShard) ? waiter : nullptr;
+                running_.Push(std::move(shardTask));
+            }
+        }
+        UC_DEBUG("Cache task({}) rank-striped segments={}, placement_mismatches={}.", task->id,
+                 segmentCounts, placementMismatchCount);
     }
     auto tpDispatch = NowTime::Now();
-    for (size_t i = 0; i < nShard; i++) {
-        auto& shard = task->desc[indexes[i]];
-        if (shard.index + 1 != nShardPerBlock_) {
-            buffer_->Prealloc(shard.owner, shard.index + 1, true);
+    for (const auto& hint : preallocHints) {
+        if (rankStriped_) {
+            buffer_->Prealloc(hint.block, hint.shard, true, hint.segment);
+        } else {
+            buffer_->Prealloc(hint.block, hint.shard, true);
         }
     }
     UC_DEBUG("Cache task({}) dispatch shards({}), wait={:.3f}ms, cost={:.3f}ms.", task->id, nShard,
@@ -271,9 +329,7 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
 }
 
 Status LoadQueue::HostToDeviceAsync(CopyStream& stream, void* host, void** device)
-{
-    return stream.HostToDeviceAsync(host, device, tensorSizes_);
-}
+{ return stream.HostToDeviceAsync(host, device, tensorSizes_); }
 
 void LoadQueue::RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
                                    bool success) const
@@ -319,8 +375,6 @@ void LoadQueue::RecordLoadSourceShards(size_t total, size_t wait) const
 }
 
 void LoadQueue::RecordH2dSyncMetrics(double h2dSyncMs) const
-{
-    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_sync_ms"), h2dSyncMs);
-}
+{ UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_h2d_sync_ms"), h2dSyncMs); }
 
 }  // namespace UC::CacheStore

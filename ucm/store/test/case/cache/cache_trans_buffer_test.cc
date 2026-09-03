@@ -21,7 +21,9 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <future>
 #include <gtest/gtest.h>
+#include <vector>
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
 #include "detail/types_helper.h"
@@ -33,6 +35,67 @@ public:
 };
 
 INSTANTIATE_TEST_CASE_P(SharedCondition, UCCacheTransBufferTest, ::testing::Values(false, true));
+
+TEST(UCCacheTransBufferSharedTest, RankStripedPlacesAndSharesSegments)
+{
+    using UC::CacheStore::Config;
+    using UC::CacheStore::TransBuffer;
+    UC::Test::Detail::Random rd;
+    constexpr size_t nRank = 2;
+    constexpr size_t shardSize = 4096;
+    Config configs[nRank];
+    TransBuffer buffers[nRank];
+    const auto uuid = rd.RandomString(10);
+    std::future<UC::Status> setup[nRank];
+    for (size_t rank = 0; rank < nRank; ++rank) {
+        auto& config = configs[rank];
+        config.uniqueId = uuid;
+        config.shardSize = shardSize;
+        config.bufferCapacity = shardSize * 9;
+        config.shareBufferEnable = true;
+        config.shareBufferRankStriped = true;
+        config.deviceId = static_cast<int32_t>(rank);
+        config.localRankSize = nRank;
+        config.loadExclusiveBufferNumber = 0;
+        config.timeoutMs = 2000;
+        setup[rank] = std::async(std::launch::async, [&buffers, &configs, rank]() {
+            return buffers[rank].Setup(configs[rank]);
+        });
+    }
+    for (auto& result : setup) { ASSERT_EQ(result.get(), UC::Status::OK()); }
+
+    const auto block0 = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    const auto block1 = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    auto segment0Owner = buffers[0].Get(block0, 0, false, false, 0);
+    auto segment1Owner = buffers[0].Get(block1, 0, false, false, 1);
+    ASSERT_EQ(segment0Owner.Segment(), 0);
+    ASSERT_EQ(segment1Owner.Segment(), 1);
+
+    auto segment0Peer = buffers[1].Get(block0, 0, false, false, 1);
+    ASSERT_EQ(segment0Peer.Segment(), 0);
+    ASSERT_FALSE(segment0Peer.Owner());
+    *static_cast<std::byte*>(segment0Owner.Data()) = std::byte{0x5a};
+    ASSERT_EQ(*static_cast<std::byte*>(segment0Peer.Data()), std::byte{0x5a});
+    std::vector<TransBuffer::Handle> heldSegment0;
+    for (size_t i = 0; i < 3; ++i) {
+        const auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+        auto handle = buffers[0].Get(block, 0, false, false, 0);
+        ASSERT_EQ(handle.Segment(), 0);
+        heldSegment0.push_back(std::move(handle));
+    }
+    const auto fallbackBlock = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
+    auto fallback = buffers[0].Get(fallbackBlock, 0, false, false, 0);
+    ASSERT_EQ(fallback.Segment(), 1);
+
+    Config watcherConfig;
+    watcherConfig.uniqueId = uuid;
+    watcherConfig.shareBufferEnable = true;
+    watcherConfig.shareBufferRankStriped = true;
+    watcherConfig.deviceId = -1;
+    TransBuffer watcher;
+    ASSERT_EQ(watcher.Setup(watcherConfig), UC::Status::OK());
+    ASSERT_TRUE(watcher.Exist(block0, 0));
+}
 
 TEST_P(UCCacheTransBufferTest, GetFirstNode)
 {
