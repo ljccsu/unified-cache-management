@@ -121,6 +121,8 @@ private:
         const auto size = shardSize_ * num;
         const auto tp = w->startTp;
         const auto isDump = (t->type == TransTask::Type::DUMP);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_load_spsc_wait_duration_ms"),
+                                 (NowTime::Now() - tp) * 1e3);
         UC_DEBUG("Posix task({},{},{},{}) dispatching.", id, brief, num, size);
         w->SetEpilog([id, brief = std::move(brief), num, size, tp, isDump] {
             auto cost = NowTime::Now() - tp;
