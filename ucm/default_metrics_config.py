@@ -653,6 +653,13 @@ _CONNECTOR_INTERFACE_DURATION_BUCKETS = [
     0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000,
     2000, 5000, 10000,
 ]
+_CONNECTOR_WAIT_FOR_LAYER_LOAD_DURATION_BUCKETS = [
+    0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.5, 2, 2.5, 3, 3.5, 4,
+    4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10, 10.5, 11, 11.5, 12, 12.5, 13, 13.5,
+    14, 14.5, 15, 15.5, 16, 16.5, 17, 17.5, 18, 18.5, 19, 19.5, 20, 20.5, 21, 21.5, 22,
+    22.5, 23, 23.5, 24, 24.5, 25, 25.5, 26, 26.5, 27, 27.5, 28, 28.5, 29, 29.5, 30, 50,
+    100, 200, 500, 1000, 2000, 5000, 10000,
+]
 _HISTOGRAM_METRICS = [
     (
         "save_duration",
@@ -685,7 +692,13 @@ _HISTOGRAM_METRICS = [
     (
         "cache_load_duration_ms",
         "End-to-end Cache stage load task duration (ms)",
-        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500, 1000, 2000, 5000],
+        [
+            0.01, 0.05, 0.1, 0.2, 0.3, 0.4, 0.5, 0.6, 0.7, 0.8, 0.9, 1, 1.5, 2, 2.5, 3,
+            3.5, 4, 4.5, 5, 5.5, 6, 6.5, 7, 7.5, 8, 8.5, 9, 9.5, 10, 10.5, 11, 11.5, 12,
+            12.5, 13, 13.5, 14, 14.5, 15, 15.5, 16, 16.5, 17, 17.5, 18, 18.5, 19, 19.5,
+            20, 20.5, 21, 21.5, 22, 22.5, 23, 23.5, 24, 24.5, 25, 25.5, 26, 26.5, 27,
+            27.5, 28, 28.5, 29, 29.5, 30, 50, 100, 200, 500, 1000, 2000, 5000,
+        ],
     ),
     (
         "cache_dump_duration_ms",
@@ -907,7 +920,11 @@ _HISTOGRAM_METRICS = [
         (
             f"connector_{method}_duration_ms",
             f"Wall-clock duration of UCMConnector.{method} invoked by vLLM (ms)",
-            _CONNECTOR_INTERFACE_DURATION_BUCKETS,
+            (
+                _CONNECTOR_WAIT_FOR_LAYER_LOAD_DURATION_BUCKETS
+                if method == "wait_for_layer_load"
+                else _CONNECTOR_INTERFACE_DURATION_BUCKETS
+            ),
         )
         for method in _CONNECTOR_INTERFACE_METHODS
     ],
