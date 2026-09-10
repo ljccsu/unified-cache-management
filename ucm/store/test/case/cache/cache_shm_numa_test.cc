@@ -25,7 +25,6 @@
 #include <future>
 #include <gtest/gtest.h>
 #include "cache/cc/posix_shm.h"
-#include "cache/cc/rank_shm_lease.h"
 #include "cache/cc/shm_numa.h"
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
@@ -83,28 +82,22 @@ TEST(UCCacheShmNumaTest, OrdinaryShmIgnoresNumaSetting)
     EXPECT_EQ(*static_cast<unsigned char*>(same.Data()), 0x5a);
 }
 
-TEST(UCCacheShmNumaTest, RankMetadataWaitsForTruncateWithoutUnlink)
+TEST(UCCacheShmNumaTest, RankMetadataWaitsForTruncate)
 {
     auto config = SmallConfig();
     config.shareBufferRankStriped = true;
     config.shareBufferNumaNodes = {0};
     config.localRankSize = 1;
     config.timeoutMs = 30;
-    UC::CacheStore::RankShmLease creatorLease;
-    ASSERT_EQ(creatorLease.Acquire(config.uniqueId, 1000), UC::Status::OK());
-    const auto name = UC::CacheStore::RankShmLease::Stem(config.uniqueId) + "_rs_meta";
+    const auto name = "uc_shm_cache_" + config.uniqueId + "_rs_meta";
     PosixShm file{name};
     ASSERT_EQ(file.ShmOpen(PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL |
                            PosixShm::OpenFlag::READ_WRITE),
               UC::Status::OK());
-    {
-        TransBuffer peer;
-        const auto status = peer.Setup(config);
-        EXPECT_TRUE(status.Failure());
-        EXPECT_NE(status.ToString().find("truncate not ready"), std::string::npos);
-    }
-    PosixShm reopened{name};
-    EXPECT_EQ(reopened.ShmOpen(PosixShm::OpenFlag::READ_WRITE), UC::Status::OK());
+    TransBuffer peer;
+    const auto status = peer.Setup(config);
+    EXPECT_TRUE(status.Failure());
+    EXPECT_NE(status.ToString().find("truncate not ready"), std::string::npos);
     file.ShmUnlink();
 }
 
@@ -159,7 +152,7 @@ TEST(UCCacheShmNumaTest, LiveConcurrentDpGroupsShareSegments)
     EXPECT_TRUE(watcher.Exist(block, 0));
     size_t allocatedBytes = 0;
     for (size_t segment = 0; segment < ranks; ++segment) {
-        PosixShm file{UC::CacheStore::RankShmLease::Stem(base.uniqueId) + "_rs_data_" +
+        PosixShm file{"uc_shm_cache_" + base.uniqueId + "_rs_data_" +
                       std::to_string(segment)};
         ASSERT_EQ(file.ShmOpen(PosixShm::OpenFlag::READ_WRITE), UC::Status::OK());
         size_t bytes = 0;

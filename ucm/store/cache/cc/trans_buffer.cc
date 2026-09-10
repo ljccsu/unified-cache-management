@@ -29,7 +29,6 @@
 #include <unistd.h>
 #include "logger/logger.h"
 #include "posix_shm.h"
-#include "rank_shm_lease.h"
 #include "shm_numa.h"
 #include "trans/buffer.h"
 #include "trans/device.h"
@@ -311,12 +310,7 @@ protected:
     SharedLayout layout_{SharedLayout::SINGLE};
     void* addrress_{nullptr};
     size_t totalSize_{0};
-    bool unlinkShm_{true};
     size_t setupTimeoutMs_{30000};
-    // Destroyed after the base destructor unmaps metadata, and after the derived
-    // destructor unregisters/unmaps every data segment.
-    std::unique_ptr<RankShmLease> rankLease_;
-
     virtual void InitLayoutMetadata() {}
     virtual Status CheckLayoutMetadata() const { return Status::OK(); }
     size_t ExpectedMagic() const
@@ -391,7 +385,6 @@ protected:
     }
     static void CleanUpShmFileExceptMe(const std::string& me)
     {
-        RankShmLease::ReapUnused();
         namespace fs = std::filesystem;
         std::string_view prefix = ShmPrefix();
         fs::path shmDir = "/dev/shm";
@@ -405,9 +398,6 @@ protected:
                 name == me) {
                 continue;
             }
-            // Versioned rank-striped groups are reclaimed through their lease.
-            // Older groups have no liveness protocol and cannot be deleted safely.
-            if (name.find("_rs_") != std::string::npos) { continue; }
             try {
                 const auto lwt = fs::last_write_time(path);
                 if (now - lwt <= keepThreshold) { continue; }
@@ -540,7 +530,7 @@ public:
     {
         if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
         if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
-        if (unlinkShm_) { PosixShm{shmName_}.ShmUnlink(); }
+        PosixShm{shmName_}.ShmUnlink();
     }
     Status Setup() override
     {
@@ -759,7 +749,6 @@ public:
         segmentCount_ = localRankSize;
         layout_ = SharedLayout::RANK_STRIPED;
         setupTimeoutMs_ = timeoutMs;
-        unlinkShm_ = false;
     }
     ~RankStripedSharedBufferStrategy() override
     {
@@ -767,6 +756,7 @@ public:
             if (registered_[segment]) { Trans::Buffer::UnregisterHostBuffer(dataBases_[segment]); }
             if (dataBases_[segment]) { PosixShm::MUnmap(dataBases_[segment], segmentSize_); }
         }
+        for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
     }
     Status Setup() override
     {
@@ -805,14 +795,10 @@ public:
             UC_INFO("Rank-striped shared buffer leaves {} tail bytes unused for equal segments.",
                     unusedBytes);
         }
-        rankLease_ = std::make_unique<RankShmLease>();
-        s = rankLease_->Acquire(uuid_, timeoutMs_);
-        if (s.Failure()) { return s; }
-        RankShmLease::ReapUnused(RankShmLease::Stem(uuid_));
-        shmName_ = RankShmLease::Stem(uuid_) + "_rs_meta";
+        shmName_ = ShmPrefix() + uuid_ + "_rs_meta";
         dataShmNames_.reserve(segmentCount_);
         for (size_t segment = 0; segment < segmentCount_; ++segment) {
-            dataShmNames_.push_back(RankShmLease::Stem(uuid_) + "_rs_data_" +
+            dataShmNames_.push_back(ShmPrefix() + uuid_ + "_rs_data_" +
                                     std::to_string(segment));
         }
         dataBases_.assign(segmentCount_, nullptr);
@@ -825,6 +811,7 @@ public:
             PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
         s = metaFile.ShmOpen(flags);
         if (s.Success()) {
+            for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
             CleanUpShmFileExceptMe(shmName_);
             s = InitShmBuffer(metaFile);
         } else if (s == Status::DuplicateKey()) {
@@ -896,18 +883,13 @@ public:
         : SharedBufferStrategy(uuid, -1, 0, 0, 0)
     {
         layout_ = rankStriped ? SharedLayout::RANK_STRIPED : SharedLayout::SINGLE;
-        if (rankStriped) { unlinkShm_ = false; }
         setupTimeoutMs_ = timeoutMs;
     }
     Status Setup() override
     {
         shmName_ = ShmPrefix() + uuid_;
         if (layout_ == SharedLayout::RANK_STRIPED) {
-            rankLease_ = std::make_unique<RankShmLease>();
-            auto s = rankLease_->Acquire(uuid_, setupTimeoutMs_);
-            if (s.Failure()) { return s; }
-            RankShmLease::ReapUnused(RankShmLease::Stem(uuid_));
-            shmName_ = RankShmLease::Stem(uuid_) + "_rs_meta";
+            shmName_ += "_rs_meta";
         }
         // In the rank-striped layout, the sibling data files are live payload segments and must
         // not be removed by the legacy single-file cleanup scan.
