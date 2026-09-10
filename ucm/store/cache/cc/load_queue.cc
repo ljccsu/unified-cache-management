@@ -231,7 +231,7 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
     if (cacheIOAggregation_) {
         s = stream.SetupIoAggregation(deviceId_, useGdr_);
     } else if (cacheSdmaDirect_) {
-        s = stream.SetupSdmaDirect(deviceId_, useGdr_);
+        s = stream.SetupSdmaDirect(deviceId_, streamNumber_, useGdr_);
     } else {
         s = stream.Setup(deviceId_, streamNumber_, useGdr_);
     }

@@ -27,6 +27,7 @@
 #include <cstddef>
 #include <cstdint>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 #include "ucmstore_v1.h"
@@ -59,7 +60,8 @@ struct Config {
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};
-    size_t streamNumber{4};
+    // Unset preserves the defaults: one SDMA Direct stream, four ordinary streams.
+    std::optional<size_t> streamNumber{};
     bool cacheLoadBackendOnly{false};
     std::vector<uintptr_t> gpuKvBufferAddrs{};
     std::vector<size_t> gpuKvBufferSizes{};
@@ -68,7 +70,8 @@ struct Config {
     bool cacheSdmaDirect{UCM_RUNTIME_ASCEND_SDMA_DIRECT};
     size_t localRankSize{8};
 
-    size_t EffectiveStreamNumber() const noexcept { return cacheSdmaDirect ? 1 : streamNumber; }
+    size_t EffectiveStreamNumber() const noexcept
+    { return streamNumber.value_or(cacheSdmaDirect ? 1 : 4); }
 };
 
 }  // namespace UC::CacheStore

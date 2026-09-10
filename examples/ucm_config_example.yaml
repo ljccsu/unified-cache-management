@@ -16,6 +16,9 @@ ucm_connectors:
       # With shared buffering enabled, set true for rank-striped SHM on NUMA nodes 0-7.
       # Leave false for ordinary SHM. share_buffer_numa_nodes is an optional override.
       share_buffer_rank_striped: false
+      # Device streams per rank and per direction (1-32). SDMA Direct defaults to 1;
+      # ordinary copies default to 4. Uncomment to compare 16 SDMA streams.
+      # cache_stream_number: 16
       storage_backends: "/mnt/test"
       posix_capacity_gb: 10240
       posix_io_engine: "psync"

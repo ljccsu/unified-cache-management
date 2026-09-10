@@ -163,7 +163,11 @@ private:
         config.GetNumber("waiting_queue_depth", param.waitingQueueDepth);
         config.GetNumber("running_queue_depth", param.runningQueueDepth);
         config.GetNumber("timeout_ms", param.timeoutMs);
-        config.GetNumber("cache_stream_number", param.streamNumber);
+        if (config.Contains("cache_stream_number")) {
+            size_t streamNumber = 0;
+            config.GetNumber("cache_stream_number", streamNumber);
+            param.streamNumber = streamNumber;
+        }
         config.GetNumber("cache_load_exclusive_buffer_number", param.loadExclusiveBufferNumber);
         config.GetNumbers("gpu_kv_buffer_addrs", param.gpuKvBufferAddrs);
         config.GetNumbers("gpu_kv_buffer_sizes", param.gpuKvBufferSizes);
@@ -247,8 +251,9 @@ private:
             return Status::InvalidParam(
                 "Cache IO aggregation is incompatible with Cache SDMA Direct");
         }
-        if (config.streamNumber < 1 || config.streamNumber > 32) {
-            return Status::InvalidParam("invalid stream number({})", config.streamNumber);
+        const auto streamNumber = config.EffectiveStreamNumber();
+        if (streamNumber < 1 || streamNumber > 32) {
+            return Status::InvalidParam("invalid stream number({})", streamNumber);
         }
         if (config.localRankSize == 0) {
             return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
@@ -303,13 +308,7 @@ private:
         UC_INFO("Set {}::WaitingQueueDepth to {}.", ns, config.waitingQueueDepth);
         UC_INFO("Set {}::RunningQueueDepth to {}.", ns, config.runningQueueDepth);
         UC_INFO("Set {}::TimeoutMs to {}.", ns, config.timeoutMs);
-        if (config.cacheSdmaDirect) {
-            UC_INFO(
-                "Set {}::StreamNumber to {} (configured={}, Cache SDMA Direct uses one stream).",
-                ns, config.EffectiveStreamNumber(), config.streamNumber);
-        } else {
-            UC_INFO("Set {}::StreamNumber to {}.", ns, config.EffectiveStreamNumber());
-        }
+        UC_INFO("Set {}::StreamNumber to {}.", ns, config.EffectiveStreamNumber());
         UC_INFO("Set {}::CacheSdmaDirect to {}.", ns, config.cacheSdmaDirect);
         UC_INFO("Set {}::LoadExclusiveBufferNumber to {}.", ns, config.loadExclusiveBufferNumber);
         UC_INFO("Set {}::GpuKvBufferNumber to {}.", ns, config.gpuKvBufferAddrs.size());

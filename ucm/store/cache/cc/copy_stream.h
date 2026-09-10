@@ -94,8 +94,11 @@ public:
         return Status::OK();
     }
 
-    Status SetupSdmaDirect(const int32_t deviceId, const bool useGdr)
+    Status SetupSdmaDirect(const int32_t deviceId, const size_t streamNumber, const bool useGdr)
     {
+        if (streamNumber == 0 || streamNumber > 32) {
+            return Status::InvalidParam("invalid SDMA Direct stream number({})", streamNumber);
+        }
         if (useGdr) {
             return Status::InvalidParam("GDR stream is incompatible with cache SDMA Direct");
         }
@@ -105,14 +108,17 @@ public:
             UC_ERROR("Failed({}) to setup device({}).", s, deviceId);
             return s;
         }
-        streams_.clear();
-        auto stream = device.MakeSdmaDirectStream();
-        if (!stream) [[unlikely]] {
-            UC_ERROR("Failed to make Cache SDMA Direct stream on device({}).", deviceId);
-            return Status::Error();
+        std::vector<std::shared_ptr<Trans::Stream>> streams;
+        streams.reserve(streamNumber);
+        for (size_t i = 0; i < streamNumber; ++i) {
+            auto stream = device.MakeSdmaDirectStream();
+            if (!stream) [[unlikely]] {
+                UC_ERROR("Failed to make Cache SDMA Direct stream({}) on device({}).", i, deviceId);
+                return Status::Error();
+            }
+            streams.push_back(std::move(stream));
         }
-        // Cache SDMA Direct intentionally uses one stream for stable performance.
-        streams_.push_back(std::move(stream));
+        streams_ = std::move(streams);
         deviceId_ = deviceId;
         streamNumber_ = streams_.size();
         streamIndex_ = 0;
