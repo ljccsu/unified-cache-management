@@ -26,6 +26,7 @@
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
+#include "shm_numa_layout.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "trans_manager.h"
 
@@ -151,6 +152,9 @@ private:
         if (param.shardSize > 0) { param.waitingQueueDepth *= (param.blockSize / param.shardSize); }
         config.Get("share_buffer_enable", param.shareBufferEnable);
         config.Get("share_buffer_rank_striped", param.shareBufferRankStriped);
+        if (param.shareBufferRankStriped) {
+            config.GetNumbers("share_buffer_numa_nodes", param.shareBufferNumaNodes);
+        }
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
         size_t bufferCapacityGb = 0;
@@ -197,6 +201,18 @@ private:
         }
         if (config.shareBufferRankStriped && config.localRankSize == 0) {
             return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
+        }
+        if (config.shareBufferRankStriped) {
+            try {
+                const auto nodes = config.shareBufferNumaNodes.empty()
+                                       ? ShmNuma::DefaultNodes()
+                                       : config.shareBufferNumaNodes;
+                ShmNuma::ValidateNodes(nodes);
+                // The scheduler discovers the segment count from shared metadata.
+                if (config.deviceId >= 0) { ShmNuma::SegmentNodes(nodes, config.localRankSize, 0); }
+            } catch (const std::exception& error) {
+                return Status::InvalidParam(std::string(error.what()));
+            }
         }
         auto s =
             Trans::GdrKVBufferConfig::Validate(config.gpuKvBufferAddrs, config.gpuKvBufferSizes);
@@ -275,6 +291,11 @@ private:
         UC_INFO("Set {}::BufferCapacity to {}GB.", ns, config.bufferCapacity >> 30);
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
         UC_INFO("Set {}::ShareBufferRankStriped to {}.", ns, config.shareBufferRankStriped);
+        if (config.shareBufferRankStriped) {
+            UC_INFO("Set {}::ShareBufferNumaNodes to {}.", ns,
+                    config.shareBufferNumaNodes.empty() ? ShmNuma::DefaultNodes()
+                                                        : config.shareBufferNumaNodes);
+        }
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
         if (config.cacheIOAggregation) {
             UC_INFO("Set {}::AggregationObject to CacheStoreShard.", ns);

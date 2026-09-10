@@ -54,6 +54,8 @@ struct Config {
     size_t loadExclusiveBufferNumber{1024};
     bool shareBufferEnable{true};
     bool shareBufferRankStriped{false};
+    // Empty selects physical NUMA nodes 0-7; ignored for ordinary SHM.
+    std::vector<size_t> shareBufferNumaNodes{};
     size_t waitingQueueDepth{8192};
     size_t runningQueueDepth{524288};
     size_t timeoutMs{30000};

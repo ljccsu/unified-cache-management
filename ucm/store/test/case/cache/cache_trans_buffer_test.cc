@@ -21,9 +21,11 @@
  * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
  * SOFTWARE.
  * */
+#include <cstdlib>
 #include <future>
 #include <gtest/gtest.h>
 #include <vector>
+#include "cache/cc/shm_numa_layout.h"
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
 #include "detail/types_helper.h"
@@ -38,6 +40,11 @@ INSTANTIATE_TEST_CASE_P(SharedCondition, UCCacheTransBufferTest, ::testing::Valu
 
 TEST(UCCacheTransBufferSharedTest, RankStripedPlacesAndSharesSegments)
 {
+    const auto* numaText = std::getenv("UCM_TEST_NUMA_NODES");
+    if (numaText == nullptr) {
+        GTEST_SKIP() << "Rank-striped initialization requires NUMA syscalls";
+    }
+    const auto numaNodes = UC::CacheStore::ShmNuma::ParseNodes(numaText);
     using UC::CacheStore::Config;
     using UC::CacheStore::TransBuffer;
     UC::Test::Detail::Random rd;
@@ -54,6 +61,7 @@ TEST(UCCacheTransBufferSharedTest, RankStripedPlacesAndSharesSegments)
         config.bufferCapacity = shardSize * 9;
         config.shareBufferEnable = true;
         config.shareBufferRankStriped = true;
+        config.shareBufferNumaNodes = {numaNodes.front()};
         config.deviceId = static_cast<int32_t>(rank);
         config.localRankSize = nRank;
         config.loadExclusiveBufferNumber = 0;

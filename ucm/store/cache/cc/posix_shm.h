@@ -28,6 +28,7 @@
 #include <fcntl.h>
 #include <string>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 #include "status/status.h"
 
@@ -67,6 +68,16 @@ public:
         auto eno = errno;
         if (ret == 0) { return Status::OK(); }
         return Status{eno, std::to_string(eno)};
+    }
+    Status Size(size_t& size) const
+    {
+        struct stat64 info{};
+        if (fstat64(handle_, &info) != 0) {
+            const auto eno = errno;
+            return Status{eno, std::to_string(eno)};
+        }
+        size = static_cast<size_t>(info.st_size);
+        return Status::OK();
     }
     Status MMap(void*& addr, size_t size, bool write, bool read, bool shared, bool populate = false)
     {

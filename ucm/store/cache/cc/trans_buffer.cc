@@ -29,6 +29,7 @@
 #include <unistd.h>
 #include "logger/logger.h"
 #include "posix_shm.h"
+#include "shm_numa.h"
 #include "trans/buffer.h"
 #include "trans/device.h"
 
@@ -276,6 +277,7 @@ protected:
         void Unlock() { pthread_spin_unlock(&lock); }
     };
     static constexpr size_t sharedBufferMagic = (('S' << 16) | ('b' << 8) | 3);
+    static constexpr size_t rankNumaMagic = (('S' << 16) | ('b' << 8) | 4);
     enum class SharedLayout : size_t { SINGLE = 0, RANK_STRIPED = 1 };
     struct BufferHeader {
         std::atomic<size_t> magic;
@@ -308,6 +310,31 @@ protected:
     SharedLayout layout_{SharedLayout::SINGLE};
     void* addrress_{nullptr};
     size_t totalSize_{0};
+    bool unlinkShm_{true};
+    size_t setupTimeoutMs_{30000};
+
+    virtual void InitLayoutMetadata() {}
+    virtual Status CheckLayoutMetadata() const { return Status::OK(); }
+    size_t ExpectedMagic() const
+    {
+        return layout_ == SharedLayout::SINGLE ? sharedBufferMagic : rankNumaMagic;
+    }
+    Status WaitShmSize(PosixShm& file, size_t minimum) const
+    {
+        const auto deadline =
+            std::chrono::steady_clock::now() + std::chrono::milliseconds(setupTimeoutMs_);
+        for (;;) {
+            size_t size = 0;
+            auto status = file.Size(size);
+            if (status.Failure()) { return status; }
+            if (size >= minimum) { return Status::OK(); }
+            if (std::chrono::steady_clock::now() >= deadline) {
+                return Status::Error(
+                    fmt::format("rank-striped SHM({}) truncate not ready", file.ShmName()));
+            }
+            std::this_thread::sleep_for(std::chrono::milliseconds(10));
+        }
+    }
 
     size_t AccessedOffset() const noexcept
     {
@@ -338,7 +365,7 @@ protected:
         auto off = SegmentReadyOffset() + SegmentReadySize();
         return (off + align - 1) & ~(align - 1);
     }
-    size_t DataOffset() const noexcept
+    virtual size_t DataOffset() const noexcept
     {
         static const auto pageSize = sysconf(_SC_PAGESIZE);
         const auto size = MetaOffset() + sizeof(BufferMetaNode) * nNode_;
@@ -403,13 +430,19 @@ protected:
         }
         return Status::OK();
     }
-    static Status WaitShmHeaderReady(BufferHeader* header)
+    Status WaitShmHeaderReady(BufferHeader* header) const
     {
         constexpr auto retryInterval = std::chrono::milliseconds(100);
-        constexpr auto maxTryTime = 100;
-        auto tryTime = 0;
+        const auto maxTryTime =
+            layout_ == SharedLayout::SINGLE ? size_t{100} : setupTimeoutMs_ / 100;
+        size_t tryTime = 0;
         do {
-            if (header->magic == sharedBufferMagic) { break; }
+            const auto magic = header->magic.load(std::memory_order_acquire);
+            if (magic == ExpectedMagic()) { break; }
+            if (layout_ == SharedLayout::RANK_STRIPED && magic != 0) {
+                return Status::InvalidParam(
+                    "rank-striped SHM({}) version mismatch; use a fresh unique_id", shmName_);
+            }
             if (tryTime > maxTryTime) { return Status::Retry(); }
             std::this_thread::sleep_for(retryInterval);
             tryTime++;
@@ -440,7 +473,8 @@ protected:
             meta_[i].Init();
             accessed_[i].store(0, std::memory_order_relaxed);
         }
-        header_->magic = sharedBufferMagic;
+        InitLayoutMetadata();
+        header_->magic.store(ExpectedMagic(), std::memory_order_release);
         return Status::OK();
     }
     Status LoadShmBuffer(PosixShm& shmFile)
@@ -450,7 +484,11 @@ protected:
             UC_ERROR("Failed({}) to open file({}).", s, shmFile.ShmName());
             return s;
         }
-        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
+        if (layout_ == SharedLayout::RANK_STRIPED) {
+            s = WaitShmSize(shmFile, sizeof(BufferHeader));
+            if (s.Failure()) { return s; }
+        }
+        s = MmapShmFile(shmFile, totalSize_, addrress_, false, layout_ == SharedLayout::SINGLE);
         if (s.Failure()) [[unlikely]] { return s; }
         header_ = static_cast<BufferHeader*>(addrress_);
         s = WaitShmHeaderReady(header_);
@@ -465,6 +503,8 @@ protected:
                 nNode_, header_->nNode, segmentCount_, header_->segmentCount, nodesPerSegment_,
                 header_->nodesPerSegment);
         }
+        s = CheckLayoutMetadata();
+        if (s.Failure()) { return s; }
         InitPointers();
         return Status::OK();
     }
@@ -496,7 +536,7 @@ public:
     {
         if (data_) { Trans::Buffer::UnregisterHostBuffer(data_); }
         if (addrress_) { PosixShm::MUnmap(addrress_, totalSize_); }
-        PosixShm{shmName_}.ShmUnlink();
+        if (unlinkShm_) { PosixShm{shmName_}.ShmUnlink(); }
     }
     Status Setup() override
     {
@@ -561,19 +601,63 @@ class RankStripedSharedBufferStrategy : public SharedBufferStrategy {
     std::vector<std::byte*> dataBases_{};
     std::vector<std::byte*> dataOnDeviceBases_{};
     std::vector<uint8_t> registered_{};
+    std::vector<uint8_t> owned_{};
+    std::vector<size_t> numaNodes_;
+    struct NumaMetadata {
+        size_t shardSize;
+        size_t nodeCount;
+    };
+    NumaMetadata* NumaInfo() const
+    {
+        return reinterpret_cast<NumaMetadata*>(static_cast<std::byte*>(addrress_) +
+                                               SharedBufferStrategy::DataOffset());
+    }
+    size_t DataOffset() const noexcept override
+    {
+        const auto page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+        const auto end = SharedBufferStrategy::DataOffset() + sizeof(NumaMetadata) +
+                         sizeof(size_t) * numaNodes_.size();
+        return (end + page - 1) / page * page;
+    }
+    void InitLayoutMetadata() override
+    {
+        auto* info = NumaInfo();
+        info->shardSize = nodeSize_;
+        info->nodeCount = numaNodes_.size();
+        std::copy(numaNodes_.begin(), numaNodes_.end(), reinterpret_cast<size_t*>(info + 1));
+    }
+    Status CheckLayoutMetadata() const override
+    {
+        auto* info = NumaInfo();
+        if (info->shardSize != nodeSize_ || info->nodeCount != numaNodes_.size()) {
+            return Status::InvalidParam(
+                "rank-striped SHM({}) shard size or NUMA node count mismatch", shmName_);
+        }
+        if (!std::equal(numaNodes_.begin(), numaNodes_.end(),
+                        reinterpret_cast<size_t*>(info + 1))) {
+            return Status::InvalidParam("rank-striped SHM({}) NUMA node list/order mismatch",
+                                        shmName_);
+        }
+        return Status::OK();
+    }
 
     Status WaitSegmentReady(size_t segment) const
     {
         const auto deadline =
             std::chrono::steady_clock::now() + std::chrono::milliseconds(timeoutMs_);
-        while (segmentReady_[segment].load(std::memory_order_acquire) == 0) {
+        for (;;) {
+            const auto ready = segmentReady_[segment].load(std::memory_order_acquire);
+            if (ready == 1) { return Status::OK(); }
+            if (ready == 2) {
+                return Status::Error(
+                    fmt::format("rank-striped segment({}) initialization failed", segment));
+            }
             if (std::chrono::steady_clock::now() >= deadline) {
                 return Status::Error(
                     fmt::format("rank-striped shared buffer segment({}) not ready", segment));
             }
             std::this_thread::sleep_for(std::chrono::milliseconds(10));
         }
-        return Status::OK();
     }
 
     Status WaitAllSegmentsReady() const
@@ -592,11 +676,21 @@ class RankStripedSharedBufferStrategy : public SharedBufferStrategy {
             PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
         auto s = shmFile.ShmOpen(flags);
         if (s.Success()) {
+            owned_[segment] = 1;
             void* addr = nullptr;
-            s = MmapShmFile(shmFile, segmentSize_, addr, true, true);
-            if (s.Failure()) { return s; }
+            s = MmapShmFile(shmFile, segmentSize_, addr, true, false);
+            if (s.Failure()) {
+                segmentReady_[segment].store(2, std::memory_order_release);
+                return s;
+            }
             dataBases_[segment] = static_cast<std::byte*>(addr);
-            std::memset(dataBases_[segment], 0, segmentSize_);
+            s = ShmNuma::Initialize(dataBases_[segment], segmentSize_,
+                                    ShmNuma::SegmentNodes(numaNodes_, segmentCount_, segment),
+                                    dataShmNames_[segment]);
+            if (s.Failure()) {
+                segmentReady_[segment].store(2, std::memory_order_release);
+                return s;
+            }
             segmentReady_[segment].store(1, std::memory_order_release);
             UC_INFO("Created rank-striped shared buffer segment({}) file({}) size({}).", segment,
                     dataShmNames_[segment], segmentSize_);
@@ -652,12 +746,15 @@ class RankStripedSharedBufferStrategy : public SharedBufferStrategy {
 public:
     RankStripedSharedBufferStrategy(const std::string& uuid, int32_t deviceId, size_t nodeSize,
                                     size_t totalSize, size_t reservedNumber, size_t localRankSize,
-                                    size_t timeoutMs)
+                                    size_t timeoutMs, const std::vector<size_t>& numaNodes)
         : SharedBufferStrategy(uuid, deviceId, nodeSize, totalSize, reservedNumber),
-          timeoutMs_(timeoutMs)
+          timeoutMs_(timeoutMs),
+          numaNodes_(numaNodes)
     {
         segmentCount_ = localRankSize;
         layout_ = SharedLayout::RANK_STRIPED;
+        setupTimeoutMs_ = timeoutMs;
+        unlinkShm_ = false;
     }
     ~RankStripedSharedBufferStrategy() override
     {
@@ -665,7 +762,9 @@ public:
             if (registered_[segment]) { Trans::Buffer::UnregisterHostBuffer(dataBases_[segment]); }
             if (dataBases_[segment]) { PosixShm::MUnmap(dataBases_[segment], segmentSize_); }
         }
-        for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
+        for (size_t segment = 0; segment < owned_.size(); ++segment) {
+            if (owned_[segment]) { PosixShm{dataShmNames_[segment]}.ShmUnlink(); }
+        }
     }
     Status Setup() override
     {
@@ -674,6 +773,9 @@ public:
             static_cast<size_t>(deviceId) >= segmentCount_) {
             return Status::InvalidParam("invalid rank-striped shared buffer layout");
         }
+        ShmNuma::ValidateNodes(numaNodes_);
+        ShmNuma::SegmentNodes(numaNodes_, segmentCount_, 0);
+        UC_INFO_UNLIMITED("Rank-striped SHM NUMA nodes: {}.", numaNodes_);
         const auto nodeCount = base_.totalSize / base_.nodeSize;
         if (base_.reservedNumber % segmentCount_ != 0 ||
             nodeCount / segmentCount_ <= base_.reservedNumber / segmentCount_) {
@@ -709,6 +811,7 @@ public:
         dataBases_.assign(segmentCount_, nullptr);
         dataOnDeviceBases_.assign(segmentCount_, nullptr);
         registered_.assign(segmentCount_, 0);
+        owned_.assign(segmentCount_, 0);
         totalSize_ = DataOffset();
 
         PosixShm metaFile{shmName_};
@@ -716,6 +819,7 @@ public:
             PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL | PosixShm::OpenFlag::READ_WRITE;
         s = metaFile.ShmOpen(flags);
         if (s.Success()) {
+            unlinkShm_ = true;
             for (const auto& name : dataShmNames_) { PosixShm{name}.ShmUnlink(); }
             CleanUpShmFileExceptMe(shmName_);
             s = InitShmBuffer(metaFile);
@@ -785,9 +889,13 @@ public:
 
 class SharedBufferWatcherStrategy : public SharedBufferStrategy {
 public:
-    SharedBufferWatcherStrategy(const std::string& uuid, bool rankStriped)
+    SharedBufferWatcherStrategy(const std::string& uuid, bool rankStriped, size_t timeoutMs)
         : SharedBufferStrategy(uuid, -1, 0, 0, 0)
-    { layout_ = rankStriped ? SharedLayout::RANK_STRIPED : SharedLayout::SINGLE; }
+    {
+        layout_ = rankStriped ? SharedLayout::RANK_STRIPED : SharedLayout::SINGLE;
+        if (rankStriped) { unlinkShm_ = false; }
+        setupTimeoutMs_ = timeoutMs;
+    }
     Status Setup() override
     {
         shmName_ = ShmPrefix() + uuid_;
@@ -803,6 +911,10 @@ public:
         }
         void* addr = nullptr;
         auto size = sizeof(BufferHeader);
+        if (layout_ == SharedLayout::RANK_STRIPED) {
+            s = WaitShmSize(shmFile, size);
+            if (s.Failure()) { return s; }
+        }
         s = MmapShmFile(shmFile, size, addr, false);
         if (s.Failure()) [[unlikely]] { return s; }
         auto header = static_cast<BufferHeader*>(addr);
@@ -820,7 +932,7 @@ public:
         nodesPerSegment_ = header->nodesPerSegment;
         shmFile.MUnmap(addr, size);
         totalSize_ = DataOffset();
-        s = MmapShmFile(shmFile, totalSize_, addrress_, false);
+        s = MmapShmFile(shmFile, totalSize_, addrress_, false, layout_ == SharedLayout::SINGLE);
         if (s.Failure()) [[unlikely]] { return s; }
         header_ = static_cast<BufferHeader*>(addrress_);
         InitPointers();
@@ -841,9 +953,13 @@ Status TransBuffer::Setup(const Config& config)
                 config.loadExclusiveBufferNumber, config.ioDirect, config.cacheSdmaDirect);
         } else if (config.deviceId >= 0) {
             if (config.shareBufferRankStriped) {
+                const auto numaNodes = config.shareBufferNumaNodes.empty()
+                                           ? ShmNuma::DefaultNodes()
+                                           : config.shareBufferNumaNodes;
                 strategy_ = std::make_shared<RankStripedSharedBufferStrategy>(
                     config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
-                    config.loadExclusiveBufferNumber, config.localRankSize, config.timeoutMs);
+                    config.loadExclusiveBufferNumber, config.localRankSize, config.timeoutMs,
+                    numaNodes);
             } else {
                 strategy_ = std::make_shared<SharedBufferStrategy>(
                     config.uniqueId, config.deviceId, config.shardSize, config.bufferCapacity,
@@ -851,12 +967,12 @@ Status TransBuffer::Setup(const Config& config)
             }
         } else {
             strategy_ = std::make_shared<SharedBufferWatcherStrategy>(
-                config.uniqueId, config.shareBufferRankStriped);
+                config.uniqueId, config.shareBufferRankStriped, config.timeoutMs);
         }
+        return strategy_->Setup();
     } catch (const std::exception& e) {
-        return Status::Error(fmt::format("failed({}) to make buffer strategy", e.what()));
+        return Status::Error(fmt::format("failed({}) to setup buffer strategy", e.what()));
     }
-    return strategy_->Setup();
 }
 
 TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shardIdx,
