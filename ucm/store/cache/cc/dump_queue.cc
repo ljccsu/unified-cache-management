@@ -51,6 +51,7 @@ Status DumpQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     cacheSdmaDirect_ = config.cacheSdmaDirect;
     rankStriped_ = config.shareBufferRankStriped;
     localRankSize_ = config.localRankSize;
+    bufferRank_ = config.EffectiveBufferRank();
     cpuAffinityCores_ = config.cpuAffinityCores;
     waiting_.Setup(config.waitingQueueDepth);
     dumping_.Setup(config.runningQueueDepth);
@@ -154,7 +155,7 @@ Status DumpQueue::DumpOneTask(CopyStream& stream, TaskPtr task)
     size_t copiedShards = 0;
     std::vector<size_t> indexes;
     if (rankStriped_) {
-        indexes = RearrangeIndex(nShard, static_cast<size_t>(deviceId_), localRankSize_);
+        indexes = RearrangeIndex(nShard, bufferRank_, localRankSize_);
     }
     for (size_t i = 0; i < nShard; i++) {
         const auto originalIndex = rankStriped_ ? indexes[i] : i;

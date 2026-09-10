@@ -26,7 +26,7 @@
 #include <numeric>
 #include "buffer_manager.h"
 #include "logger/logger.h"
-#include "shm_numa_layout.h"
+#include "shm_numa.h"
 #include "trans/cuda/gdr/gdr_config.h"
 #include "trans_manager.h"
 
@@ -154,6 +154,11 @@ private:
         config.Get("share_buffer_rank_striped", param.shareBufferRankStriped);
         if (param.shareBufferRankStriped) {
             config.GetNumbers("share_buffer_numa_nodes", param.shareBufferNumaNodes);
+            if (config.Contains("share_buffer_rank")) {
+                size_t rank = static_cast<size_t>(-1);
+                config.GetNumber("share_buffer_rank", rank);
+                param.shareBufferRank = rank;
+            }
         }
         if (!param.shareBufferEnable) { param.bufferCapacity /= 8; }
         config.Get("io_direct", param.ioDirect);
@@ -192,7 +197,7 @@ private:
         }
         return Status::OK();
     }
-    Status CheckConfig(const Config& config)
+    Status CheckConfig(Config& config)
     {
         if (!config.storeBackend) { return Status::InvalidParam("invalid store backend"); }
         if (config.deviceId < -1) {
@@ -208,9 +213,10 @@ private:
         }
         if (config.shareBufferRankStriped) {
             try {
-                const auto nodes = config.shareBufferNumaNodes.empty()
-                                       ? ShmNuma::DefaultNodes()
-                                       : config.shareBufferNumaNodes;
+                if (config.shareBufferNumaNodes.empty()) {
+                    config.shareBufferNumaNodes = ShmNuma::DefaultNodes();
+                }
+                const auto& nodes = config.shareBufferNumaNodes;
                 ShmNuma::ValidateNodes(nodes);
                 // The scheduler discovers the segment count from shared metadata.
                 if (config.deviceId >= 0) { ShmNuma::SegmentNodes(nodes, config.localRankSize, 0); }
@@ -259,9 +265,9 @@ private:
             return Status::InvalidParam("invalid local rank size({})", config.localRankSize);
         }
         if (config.shareBufferRankStriped) {
-            if (static_cast<size_t>(config.deviceId) >= config.localRankSize) {
-                return Status::InvalidParam("device({}) must be a local rank smaller than {}",
-                                            config.deviceId, config.localRankSize);
+            if (config.EffectiveBufferRank() >= config.localRankSize) {
+                return Status::InvalidParam("shared buffer rank({}) must be smaller than {}",
+                                            config.EffectiveBufferRank(), config.localRankSize);
             }
             if (config.loadExclusiveBufferNumber % config.localRankSize != 0) {
                 return Status::InvalidParam(
@@ -297,9 +303,11 @@ private:
         UC_INFO("Set {}::ShareBufferEnable to {}.", ns, config.shareBufferEnable);
         UC_INFO("Set {}::ShareBufferRankStriped to {}.", ns, config.shareBufferRankStriped);
         if (config.shareBufferRankStriped) {
+            if (config.deviceId >= 0) {
+                UC_INFO("Set {}::ShareBufferRank to {}.", ns, config.EffectiveBufferRank());
+            }
             UC_INFO("Set {}::ShareBufferNumaNodes to {}.", ns,
-                    config.shareBufferNumaNodes.empty() ? ShmNuma::DefaultNodes()
-                                                        : config.shareBufferNumaNodes);
+                    config.shareBufferNumaNodes);
         }
         UC_INFO("Set {}::CacheIOAggregation to {}.", ns, config.cacheIOAggregation);
         if (config.cacheIOAggregation) {

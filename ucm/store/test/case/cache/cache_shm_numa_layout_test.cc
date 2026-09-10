@@ -45,9 +45,10 @@ void Reject(F function)
 }
 void CheckLayouts()
 {
-    const auto nodes = Numa::DefaultNodes();
-    Require(nodes == std::vector<size_t>({0, 1, 2, 3, 4, 5, 6, 7}));
+    const std::vector<size_t> nodes{0, 1, 2, 3, 4, 5, 6, 7};
     Require(Numa::ParseNodes("0-7") == nodes);
+    Require(Numa::SelectMemoryNodes({0, 2, 5}, {2, 3, 5}) == std::vector<size_t>({2, 5}));
+    Reject([] { Numa::SelectMemoryNodes({0, 2}, {1, 3}); });
     constexpr size_t gib = 1024ULL * 1024 * 1024;
     for (size_t pageSize : {4096, 65536}) {
         const auto equal = Numa::Plan(32 * gib, pageSize, nodes);
@@ -92,7 +93,27 @@ void CheckLayouts()
     Reject([&] { Numa::Plan(4096, 4096, nodes); });
     Reject([&] { Numa::Plan(gib, 0, nodes); });
     Reject([&] { Numa::Plan(std::numeric_limits<size_t>::max(), 4096, nodes); });
-    Reject([&] { Numa::SegmentNodes(nodes, 4, 0); });
+    Require(Numa::SegmentNodes(nodes, 4, 0) == std::vector<size_t>({0, 1}));
+    Require(Numa::SegmentNodes(nodes, 4, 3) == std::vector<size_t>({6, 7}));
+    Require(Numa::SegmentNodes({2, 4, 6}, 2, 1) == std::vector<size_t>({2, 4, 6}));
+    // Exercise more nodes than ranks and non-divisible counts. Compare physical
+    // bytes summed over all segments, not just logical segment counts.
+    for (const size_t ranks : {1, 2, 4, 8, 16}) {
+        for (const size_t count : {1, 3, 4, 8, 12}) {
+            std::vector<size_t> selected(count);
+            std::iota(selected.begin(), selected.end(), 0);
+            std::vector<size_t> bytesPerNode(count);
+            for (size_t segment = 0; segment < ranks; ++segment) {
+                for (const auto& range : Numa::Plan(120 * 4096, 4096,
+                                                   Numa::SegmentNodes(selected, ranks, segment))) {
+                    bytesPerNode[range.node] += range.bytes;
+                }
+            }
+            Require(*std::min_element(bytesPerNode.begin(), bytesPerNode.end()) ==
+                    *std::max_element(bytesPerNode.begin(), bytesPerNode.end()));
+        }
+    }
+    Reject([&] { Numa::SegmentNodes(nodes, 0, 0); });
     Reject([&] { Numa::SegmentNodes(nodes, 16, 16); });
     Require(Numa::Plan(1, 4096, {}).empty());
 }

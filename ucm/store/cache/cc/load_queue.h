@@ -42,6 +42,11 @@ class LoadQueue {
     using WaiterPtr = std::shared_ptr<Latch>;
     using TaskPair = std::pair<TaskPtr, WaiterPtr>;
     using TaskIdSet = HashSet<Detail::TaskHandle>;
+    struct BackendLoad {
+        Detail::TaskHandle taskHandle;
+        TransBuffer::Handle bufferHandle;
+    };
+    using OwnedLoads = std::vector<BackendLoad>;
     struct ShardTask {
         TaskPtr task;
         Detail::Shard shard;
@@ -49,6 +54,9 @@ class LoadQueue {
         Detail::TaskHandle backendTaskHandle;
         WaiterPtr waiter;
         bool fromPosix{false};
+        // Built before enqueue, then accessed only by the transfer thread.
+        // Pins every owned S2H destination, including shards later in running_.
+        std::shared_ptr<OwnedLoads> ownedLoads;
     };
 
 private:
@@ -66,6 +74,7 @@ private:
     bool rankStriped_{false};
     std::vector<ssize_t> cpuAffinityCores_{};
     size_t localRankSize_{};
+    size_t bufferRank_{};
     SpscRingQueue<TaskPair> waiting_;
     SpscRingQueue<ShardTask> running_;
     std::thread dispatcher_;
@@ -83,6 +92,9 @@ private:
     void TransferStage(std::promise<Status>& started);
     void TransferOneTask(CopyStream& stream, ShardTask&& task);
     Status WaitBackendTaskReady(ShardTask& task);
+    void CompleteOwnedLoad(BackendLoad& load, const Status& checkStatus = Status::OK());
+    void ProgressOwnedLoads(const std::shared_ptr<OwnedLoads>& loads);
+    void DrainOwnedLoads(const std::shared_ptr<OwnedLoads>& loads);
     Status HostToDeviceAsync(CopyStream& stream, void* host, void** device);
     void RecordShardResults(const std::vector<ShardTask>& tasks, const ShardTask* extra,
                             bool success) const;

@@ -25,6 +25,7 @@
 #include <future>
 #include <gtest/gtest.h>
 #include "cache/cc/posix_shm.h"
+#include "cache/cc/rank_shm_lease.h"
 #include "cache/cc/shm_numa.h"
 #include "cache/cc/trans_buffer.h"
 #include "detail/random.h"
@@ -57,14 +58,10 @@ TEST(UCCacheShmNumaTest, RankStripedRejectsInvalidConfigurationBeforeAllocation)
     config.shareBufferNumaNodes = {0, 0};
     TransBuffer duplicate;
     EXPECT_TRUE(duplicate.Setup(config).Failure());
-    config.shareBufferNumaNodes = {0, 1};
-    config.localRankSize = 1;
-    TransBuffer uneven;
-    EXPECT_TRUE(uneven.Setup(config).Failure());
-    config.shareBufferNumaNodes.clear();
-    TransBuffer defaultNodes;
-    // Missing nodes still selects all eight defaults, which one rank cannot cover.
-    EXPECT_TRUE(defaultNodes.Setup(config).Failure());
+    config.shareBufferNumaNodes = {0};
+    config.shareBufferRank = config.localRankSize;
+    TransBuffer invalidRank;
+    EXPECT_TRUE(invalidRank.Setup(config).Failure());
 }
 
 TEST(UCCacheShmNumaTest, OrdinaryShmIgnoresNumaSetting)
@@ -93,7 +90,9 @@ TEST(UCCacheShmNumaTest, RankMetadataWaitsForTruncateWithoutUnlink)
     config.shareBufferNumaNodes = {0};
     config.localRankSize = 1;
     config.timeoutMs = 30;
-    const auto name = "uc_shm_cache_" + config.uniqueId + "_rs_meta";
+    UC::CacheStore::RankShmLease creatorLease;
+    ASSERT_EQ(creatorLease.Acquire(config.uniqueId, 1000), UC::Status::OK());
+    const auto name = UC::CacheStore::RankShmLease::Stem(config.uniqueId) + "_rs_meta";
     PosixShm file{name};
     ASSERT_EQ(file.ShmOpen(PosixShm::OpenFlag::CREATE | PosixShm::OpenFlag::EXCL |
                            PosixShm::OpenFlag::READ_WRITE),
@@ -110,23 +109,27 @@ TEST(UCCacheShmNumaTest, RankMetadataWaitsForTruncateWithoutUnlink)
 }
 
 // Opt in on a Linux NUMA host. Use the simu backend to exercise real SHM without devices.
-TEST(UCCacheShmNumaTest, LiveConcurrentRankStriped)
+TEST(UCCacheShmNumaTest, LiveConcurrentDpGroupsShareSegments)
 {
     const auto* text = std::getenv("UCM_TEST_NUMA_NODES");
     if (text == nullptr) { GTEST_SKIP() << "Set UCM_TEST_NUMA_NODES, e.g. 0-7"; }
     const auto nodes = Numa::ParseNodes(text);
     auto base = SmallConfig();
-    const auto ranks = nodes.size() * 2;
+    const auto ranks = nodes.size();
+    const auto participants = ranks * 2;
     base.shareBufferRankStriped = true;
     base.shareBufferNumaNodes = nodes;
     base.localRankSize = ranks;
     base.bufferCapacity = base.shardSize * 32 * ranks;
     base.timeoutMs = 10000;
-    std::vector<Config> configs(ranks, base);
-    std::vector<TransBuffer> buffers(ranks);
+    std::vector<Config> configs(participants, base);
+    std::vector<TransBuffer> buffers(participants);
     std::vector<std::future<UC::Status>> setups;
-    for (size_t rank = 0; rank < ranks; ++rank) {
+    for (size_t rank = 0; rank < participants; ++rank) {
+        // On eight nodes this models DP2 x TP8: sixteen devices race to create
+        // only eight shared data segments, with one common capacity budget.
         configs[rank].deviceId = static_cast<int32_t>(rank);
+        configs[rank].shareBufferRank = rank % ranks;
         setups.push_back(std::async(std::launch::async,
                                     [&, rank] { return buffers[rank].Setup(configs[rank]); }));
     }
@@ -135,7 +138,7 @@ TEST(UCCacheShmNumaTest, LiveConcurrentRankStriped)
     const auto block = UC::Test::Detail::TypesHelper::MakeBlockIdRandomly();
     auto owner = buffers[0].Get(block, 0, false, false, 0);
     *static_cast<unsigned char*>(owner.Data()) = 0xa5;
-    for (size_t rank = 1; rank < ranks; ++rank) {
+    for (size_t rank = 1; rank < participants; ++rank) {
         auto peer = buffers[rank].Get(block, 0);
         EXPECT_EQ(*static_cast<unsigned char*>(peer.Data()), 0xa5);
     }
@@ -154,7 +157,14 @@ TEST(UCCacheShmNumaTest, LiveConcurrentRankStriped)
     TransBuffer watcher;
     ASSERT_EQ(watcher.Setup(watcherConfig), UC::Status::OK());
     EXPECT_TRUE(watcher.Exist(block, 0));
+    size_t allocatedBytes = 0;
     for (size_t segment = 0; segment < ranks; ++segment) {
+        PosixShm file{UC::CacheStore::RankShmLease::Stem(base.uniqueId) + "_rs_data_" +
+                      std::to_string(segment)};
+        ASSERT_EQ(file.ShmOpen(PosixShm::OpenFlag::READ_WRITE), UC::Status::OK());
+        size_t bytes = 0;
+        ASSERT_EQ(file.Size(bytes), UC::Status::OK());
+        allocatedBytes += bytes;
         auto handle = buffers[0].Get(UC::Test::Detail::TypesHelper::MakeBlockIdRandomly(), 0, false,
                                      false, segment);
         EXPECT_EQ(handle.Segment(), segment);
@@ -163,4 +173,5 @@ TEST(UCCacheShmNumaTest, LiveConcurrentRankStriped)
         };
         EXPECT_NO_THROW(Numa::Verify(handle.Data(), range, "live-rank-segment"));
     }
+    EXPECT_EQ(allocatedBytes, base.bufferCapacity);
 }

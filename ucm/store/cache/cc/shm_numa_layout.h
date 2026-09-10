@@ -28,6 +28,7 @@
 #include <charconv>
 #include <cstddef>
 #include <limits>
+#include <numeric>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -35,8 +36,6 @@
 #include <vector>
 
 namespace UC::CacheStore::ShmNuma {
-
-inline std::vector<size_t> DefaultNodes() { return {0, 1, 2, 3, 4, 5, 6, 7}; }
 
 // Physical node IDs, in the user's order. Ranges such as 0-7 are accepted.
 inline std::vector<size_t> ParseNodes(std::string_view text)
@@ -103,6 +102,20 @@ inline void ValidateNodes(const std::vector<size_t>& nodes)
     }
 }
 
+inline std::vector<size_t> SelectMemoryNodes(const std::vector<size_t>& memory,
+                                            const std::vector<size_t>& allowed)
+{
+    ValidateNodes(memory);
+    std::vector<size_t> nodes;
+    for (const auto node : memory) {
+        if (std::find(allowed.begin(), allowed.end(), node) != allowed.end()) {
+            nodes.push_back(node);
+        }
+    }
+    if (nodes.empty()) { throw std::invalid_argument("no allowed NUMA memory nodes"); }
+    return nodes;
+}
+
 // Preserve usable cache capacity. Distribute base pages with at most one page of imbalance.
 inline std::vector<Range> Plan(size_t bytes, size_t pageSize, const std::vector<size_t>& nodes)
 {
@@ -130,10 +143,16 @@ inline std::vector<size_t> SegmentNodes(const std::vector<size_t>& nodes, size_t
                                         size_t segment)
 {
     if (nodes.empty()) { return {}; }
-    if (segments == 0 || segment >= segments || segments % nodes.size() != 0) {
-        throw std::invalid_argument("rank-striped segment count must be a multiple of NUMA nodes");
+    ValidateNodes(nodes);
+    if (segments == 0 || segment >= segments) {
+        throw std::invalid_argument("invalid rank-striped segment count or index");
     }
-    return {nodes[segment % nodes.size()]};
+    // Keep s % nodeCount for the usual TP16/8-node case. Otherwise each segment
+    // spans an equal-sized node group, so every node gets the same share overall.
+    const auto groups = std::gcd(segments, nodes.size());
+    const auto perGroup = nodes.size() / groups;
+    const auto first = (segment % groups) * perGroup;
+    return {nodes.begin() + first, nodes.begin() + first + perGroup};
 }
 
 }  // namespace UC::CacheStore::ShmNuma

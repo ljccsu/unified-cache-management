@@ -1,4 +1,4 @@
-﻿import copy
+import copy
 import glob
 import math
 import os
@@ -1587,6 +1587,45 @@ class UCMDirectConnector(KVConnectorBase_V1):
         # (before store creation) if the tmpfs cannot hold it.
         _check_shm_capacity(int(config["cache_buffer_capacity_gb"]))
 
+    def _configure_rank_striped_store(self, config: dict[str, Any]) -> None:
+        if not config.get("share_buffer_rank_striped", False):
+            return
+        if not self.is_mla or not config.get("share_buffer_enable", False):
+            raise ValueError(
+                "rank-striped SHM requires MLA and share_buffer_enable=true"
+            )
+        parallel = self._vllm_config.parallel_config
+        pp_rank = (
+            parallel.rank // parallel.tensor_parallel_size
+        ) % parallel.pipeline_parallel_size
+        # Preserve cross-DP MLA cache sharing and its single capacity budget.
+        # Two local DP groups may race to create the same TP-indexed segment;
+        # the C++ O_EXCL/READY protocol elects a single creator.
+        if parallel.pipeline_parallel_size > 1:
+            config["unique_id"] += f"_pp{pp_rank}"
+        if self._role != KVConnectorRole.WORKER:
+            return
+        # Check the actual TP process group, including Ray/container placement.
+        # This collective runs once per connector, before any UCM SHM is created.
+        topology = getattr(self, "_rank_striped_topology", None)
+        if topology is None:
+            from vllm.distributed.parallel_state import (
+                get_tp_group,
+                in_the_same_node_as,
+            )
+
+            tp_group = get_tp_group()
+            same_node = in_the_same_node_as(tp_group.cpu_group, source_rank=0)
+            if len(same_node) != self.tp_size or not all(same_node):
+                raise ValueError(
+                    "rank-striped SHM requires the entire TP group to share one "
+                    f"host /dev/shm (TP={self.tp_size}, same-node ranks={same_node}); "
+                    "cross-node TP is unsupported. Set share_buffer_rank_striped=false."
+                )
+            topology = (tp_group.rank_in_group, tp_group.world_size)
+            self._rank_striped_topology = topology
+        config["share_buffer_rank"], config["local_rank_size"] = topology
+
     def _create_store(
         self,
         kv_cache_layout: Optional[KVCacheLayout],
@@ -1609,6 +1648,7 @@ class UCMDirectConnector(KVConnectorBase_V1):
             config["storage_backends"] = backends
         config["unique_id"] = f"{self.unique_id}"
         config["tensor_layout"] = "mla" if self.is_mla else "gqa"
+        self._configure_rank_striped_store(config)
         if self._role == KVConnectorRole.WORKER:
             config["device_id"] = self.device_id
             tensor_size_list = kv_cache_layout.tensor_size_list * self.blocks_per_chunk

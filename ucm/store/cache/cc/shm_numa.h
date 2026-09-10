@@ -70,6 +70,19 @@ inline std::vector<size_t> AllowedNodes()
     throw std::runtime_error("cannot read Mems_allowed_list from /proc/self/status");
 }
 
+inline std::vector<size_t> DefaultNodes()
+{
+    std::ifstream memoryNodes("/sys/devices/system/node/has_memory");
+    std::string text;
+    if (!(memoryNodes >> text)) {
+        throw std::runtime_error("cannot read /sys/devices/system/node/has_memory; "
+                                 "set share_buffer_numa_nodes explicitly");
+    }
+    const auto online = ParseNodes(text);
+    const auto allowed = AllowedNodes();
+    return SelectMemoryNodes(online, allowed);
+}
+
 inline void ValidateAllowedNodes(const std::vector<size_t>& nodes)
 {
     const auto allowed = AllowedNodes();

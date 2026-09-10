@@ -50,6 +50,8 @@ Status LoadQueue::Setup(const Config& config, TaskIdSet* failureSet, TransBuffer
     rankStriped_ = config.shareBufferRankStriped;
     cpuAffinityCores_ = config.cpuAffinityCores;
     localRankSize_ = config.localRankSize;
+    bufferRank_ = config.shareBufferRankStriped ? config.EffectiveBufferRank()
+                                               : static_cast<size_t>(config.deviceId);
     waiting_.Setup(config.waitingQueueDepth);
     running_.Setup(config.runningQueueDepth);
     holder_.reserve(1024);
@@ -113,7 +115,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     const auto nShard = task->desc.size();
     size_t backendSubmitCount = 0;
     size_t waitShardCount = 0;
-    const auto indexes = RearrangeIndex(nShard, deviceId_, localRankSize_);
+    const auto indexes = RearrangeIndex(nShard, bufferRank_, localRankSize_);
     struct PreallocHint {
         Detail::BlockId block;
         size_t shard;
@@ -123,6 +125,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     preallocHints.reserve(nShard);
     std::vector<std::vector<ShardTask>> segmentBuckets;
     if (rankStriped_) { segmentBuckets.resize(localRankSize_); }
+    std::shared_ptr<OwnedLoads> ownedLoads;
     size_t placementMismatchCount = 0;
     for (size_t i = 0; i < nShard; i++) {
         const auto originalIndex = indexes[i];
@@ -150,20 +153,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                     NAME_TO_METRIC_ID("cache_backend_load_submit_errors_total"), 1.0);
                 RecordLoadSourceShards(i + 1, waitShardCount);
                 RecordFailedShards(rankStriped_ ? nShard : nShard - i);
-                if (rankStriped_) {
-                    for (auto& bucket : segmentBuckets) {
-                        for (auto& pending : bucket) {
-                            if (pending.backendTaskHandle != 0) {
-                                auto waitStatus = backend_->Wait(pending.backendTaskHandle);
-                                if (waitStatus.Success()) {
-                                    pending.bufferHandle.MarkReady();
-                                } else {
-                                    pending.bufferHandle.MarkFailed(waitStatus);
-                                }
-                            }
-                        }
-                    }
-                }
+                if (rankStriped_) { DrainOwnedLoads(ownedLoads); }
                 shardTask.bufferHandle.MarkFailed(res.Error());
                 task->Fail(res.Error());
                 failureSet_->Insert(task->id);
@@ -171,6 +161,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                 return;
             }
             shardTask.backendTaskHandle = res.Value();
+            if (rankStriped_) {
+                if (!ownedLoads) { ownedLoads = std::make_shared<OwnedLoads>(); }
+                ownedLoads->push_back({res.Value(), shardTask.bufferHandle});
+            }
             backendSubmitCount++;
         }
         const auto actualSegment = shardTask.bufferHandle.Segment();
@@ -193,9 +187,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         std::vector<size_t> segmentCounts(localRankSize_);
         size_t pushed = 0;
         for (size_t phase = 0; phase < localRankSize_; ++phase) {
-            const auto segment = (static_cast<size_t>(deviceId_) + phase) % localRankSize_;
+            const auto segment = (bufferRank_ + phase) % localRankSize_;
             segmentCounts[segment] = segmentBuckets[segment].size();
             for (auto& shardTask : segmentBuckets[segment]) {
+                shardTask.ownedLoads = ownedLoads;
                 shardTask.waiter = (++pushed == nShard) ? waiter : nullptr;
                 running_.Push(std::move(shardTask));
             }
@@ -249,8 +244,12 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
     auto parentTask = task.task;
     const auto taskHandle = parentTask->id;
     if (failureSet_->Contains(taskHandle)) {
+        // Cancellation must not release buffers still being written by our backend,
+        // or leave other ranks waiting for READY that only this rank can publish.
+        if (rankStriped_) { DrainOwnedLoads(task.ownedLoads); }
         RecordFailedShards(1);
         if (task.waiter) {
+            if (rankStriped_ && !holder_.empty()) { (void)stream.Synchronize(); }
             holder_.clear();
             task.waiter->Done();
         }
@@ -300,12 +299,33 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
     if (s.Failure()) [[unlikely]] {
         parentTask->Fail(s);
         failureSet_->Insert(taskHandle);
+        if (rankStriped_) {
+            DrainOwnedLoads(task.ownedLoads);
+            // A failed H2D submission may have partially enqueued work. Keep the
+            // current buffer and earlier submissions alive until the stream drain.
+            (void)stream.Synchronize();
+            holder_.clear();
+        }
     }
     if (waiter) { waiter->Done(); }
 }
 
 Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
 {
+    if (rankStriped_ && task.backendTaskHandle != 0) {
+        // An owner waits directly for its own read, without polling other reads.
+        // Peer-wait progress may have already consumed this handle and published
+        // READY/FAILED; only handles still in ownedLoads require Wait.
+        auto& loads = *task.ownedLoads;
+        for (size_t i = 0; i < loads.size(); ++i) {
+            if (loads[i].taskHandle != task.backendTaskHandle) { continue; }
+            CompleteOwnedLoad(loads[i]);
+            if (i + 1 != loads.size()) { loads[i] = std::move(loads.back()); }
+            loads.pop_back();
+            break;
+        }
+        task.backendTaskHandle = 0;
+    }
     if (task.backendTaskHandle != 0) {
         auto s = backend_->Wait(task.backendTaskHandle);
         if (s.Failure()) [[unlikely]] {
@@ -324,8 +344,50 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
         if (state == TransBuffer::State::READY) { return Status::OK(); }
         if (state == TransBuffer::State::FAILED) { return task.bufferHandle.FailureStatus(); }
         if (failureSet_->Contains(task.task->id)) { return task.task->FailureStatus(); }
+        // Actual-segment order may put a peer-owned shard before our own shard.
+        // Publish completed owned reads without changing the H2D FIFO order.
+        ProgressOwnedLoads(task.ownedLoads);
         std::this_thread::yield();
     }
+}
+
+void LoadQueue::CompleteOwnedLoad(BackendLoad& load, const Status& checkStatus)
+{
+    // Wait consumes the backend handle and fences writes even when Check failed.
+    auto s = backend_->Wait(load.taskHandle);
+    if (checkStatus.Failure()) { s = checkStatus; }
+    if (s.Success()) {
+        load.bufferHandle.MarkReady();
+    } else {
+        UC_ERROR("Failed({}) to complete owned backend load({}).", s, load.taskHandle);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_backend_load_wait_errors_total"), 1.0);
+        load.bufferHandle.MarkFailed(s);
+    }
+}
+
+void LoadQueue::ProgressOwnedLoads(const std::shared_ptr<OwnedLoads>& loads)
+{
+    if (!loads) { return; }
+    for (size_t i = 0; i < loads->size();) {
+        auto& load = (*loads)[i];
+        auto ready = backend_->Check(load.taskHandle);
+        if (ready && !ready.Value()) {
+            ++i;
+            continue;
+        }
+        CompleteOwnedLoad(load, ready ? Status::OK() : ready.Error());
+        // Completed handles are consumed exactly once. Order here is independent
+        // of the actual-segment order already preserved in running_.
+        if (i + 1 != loads->size()) { load = std::move(loads->back()); }
+        loads->pop_back();
+    }
+}
+
+void LoadQueue::DrainOwnedLoads(const std::shared_ptr<OwnedLoads>& loads)
+{
+    if (!loads) { return; }
+    for (auto& load : *loads) { CompleteOwnedLoad(load); }
+    loads->clear();
 }
 
 Status LoadQueue::HostToDeviceAsync(CopyStream& stream, void* host, void** device)
