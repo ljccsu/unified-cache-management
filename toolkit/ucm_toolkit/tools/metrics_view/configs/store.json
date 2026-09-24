@@ -508,6 +508,94 @@
       "unit": "ms"
     },
     {
+      "name": "Cache Load Buffer Get Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:cache_load_buffer_get_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Buffer Get Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:cache_load_buffer_get_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Buffer Get Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:cache_load_buffer_get_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Buffer Get Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:cache_load_buffer_get_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:cache_load_buffer_get_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend Load Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:cache_load_backend_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend Load Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:cache_load_backend_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend Load Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:cache_load_backend_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend Load Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:cache_load_backend_load_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:cache_load_backend_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
       "name": "Cache Dump MkBuf Duration: p50",
       "type": "promql",
       "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:cache_dump_mkbuf_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
@@ -764,6 +852,138 @@
       "name": "Cache Load Backend Wait Duration: avg",
       "type": "promql",
       "expr": "sum by (model_name) (rate(ucm:cache_shard_backend_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:cache_shard_backend_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend IO Wait Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:cache_shard_backend_io_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend IO Wait Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:cache_shard_backend_io_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend IO Wait Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:cache_shard_backend_io_wait_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Backend IO Wait Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:cache_shard_backend_io_wait_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:cache_shard_backend_io_wait_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:posix_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:posix_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:posix_load_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:posix_load_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:posix_load_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Xfer Wake Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:cache_xfer_wake_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Xfer Wake Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:cache_xfer_wake_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Xfer Wake Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:cache_xfer_wake_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Cache Load Xfer Wake Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:cache_xfer_wake_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:cache_xfer_wake_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
       "value": "value",
       "aggregate": "sum",
       "group_by": [
@@ -1648,6 +1868,94 @@
       "unit": "ms"
     },
     {
+      "name": "Posix Load Push Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:posix_load_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Push Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:posix_load_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Push Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:posix_load_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Load Push Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:posix_load_push_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:posix_load_push_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Dump Push Duration: p50",
+      "type": "promql",
+      "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:posix_dump_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Dump Push Duration: p90",
+      "type": "promql",
+      "expr": "histogram_quantile(0.9, sum by (le, model_name) (rate(ucm:posix_dump_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Dump Push Duration: p99",
+      "type": "promql",
+      "expr": "histogram_quantile(0.99, sum by (le, model_name) (rate(ucm:posix_dump_push_duration_ms_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
+      "name": "Posix Dump Push Duration: avg",
+      "type": "promql",
+      "expr": "sum by (model_name) (rate(ucm:posix_dump_push_duration_ms_sum{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))\n/\nsum by (model_name) (rate(ucm:posix_dump_push_duration_ms_count{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval]))",
+      "value": "value",
+      "aggregate": "sum",
+      "group_by": [
+        "model_name"
+      ],
+      "unit": "ms"
+    },
+    {
       "name": "Posix S2H Bandwidth (per task): p50",
       "type": "promql",
       "expr": "histogram_quantile(0.5, sum by (le, model_name) (rate(ucm:posix_s2h_bandwidth_gbps_bucket{model_name=\"$model_name\", job=~\"$job\", engine=~\"$engine\", worker_rank=~\"$worker_rank\"}[$__rate_interval])))",
@@ -1776,4 +2084,4 @@
       ]
     }
   ]
-}
+}

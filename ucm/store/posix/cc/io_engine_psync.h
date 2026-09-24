@@ -140,7 +140,12 @@ private:
             UC::Metrics::UpdateStats(isDump ? dumpBandwidth : loadBandwidth, bwGbps);
             UC::Metrics::UpdateStats(isDump ? dumpBytes : loadBytes, static_cast<double>(size));
         });
+        auto tpPushStart = NowTime::Now();
         queue_.Push(t, w);
+        auto pushDurationMs = (NowTime::Now() - tpPushStart) * 1e3;
+        static UC::Metrics::CachedMetric loadPushDuration{"posix_load_push_duration_ms"};
+        static UC::Metrics::CachedMetric dumpPushDuration{"posix_dump_push_duration_ms"};
+        UC::Metrics::UpdateStats(isDump ? dumpPushDuration : loadPushDuration, pushDurationMs);
     }
 };
 

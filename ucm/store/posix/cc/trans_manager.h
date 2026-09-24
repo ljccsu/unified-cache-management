@@ -25,6 +25,7 @@
 #define UNIFIEDCACHE_POSIX_STORE_CC_TRANS_MANAGER_H
 
 #include "io_engine_aio.h"
+#include "io_engine_iouring.h"
 #include "io_engine_psync.h"
 
 namespace UC::PosixStore {
@@ -39,6 +40,10 @@ public:
             ioEngine_ = &ioEngineAio_;
             return ioEngineAio_.Setup(config, layout);
         }
+        if (config.ioEngine == "iouring") {
+            ioEngine_ = &ioEngineIoUring_;
+            return ioEngineIoUring_.Setup(config, layout);
+        }
         if (config.ioEngine == "psync") {
             ioEngine_ = &ioEnginePsync_;
             return ioEnginePsync_.Setup(config, layout);
@@ -49,6 +54,7 @@ public:
 
 private:
     IoEngineAio ioEngineAio_;
+    IoEngineIoUring ioEngineIoUring_;
     IoEnginePsync ioEnginePsync_;
     IoEngine* ioEngine_{nullptr};
 };

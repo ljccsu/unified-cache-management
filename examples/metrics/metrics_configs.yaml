@@ -408,9 +408,24 @@ histogram:
   - name: "cache_load_backend_submit_duration_ms"
     documentation: "Cache load backend submit duration: buffer allocation plus synchronous backend load submission (ms)."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "cache_load_buffer_get_duration_ms"
+    documentation: "Cache load buffer Get duration: total time spent in buffer_->Get() across all shards in one dispatch task (ms). Sub-component of cache_load_backend_submit_duration_ms."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "cache_load_backend_load_duration_ms"
+    documentation: "Cache load backend Load duration: total time spent in backend_->Load() across all shards in one dispatch task (ms). Sub-component of cache_load_backend_submit_duration_ms; zero when all shards hit the buffer."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
   - name: "cache_shard_backend_wait_ms"
     documentation: "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit (ms). This is not a task-level duration."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "posix_load_duration_ms"
+    documentation: "Cache load per-layer wall-clock time from all backend Load submissions done to the last shard backend IO ready (ms). Cross-thread ucm_load_disp -> ucm_load_xfer; only recorded when at least one shard hit backend."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_shard_backend_io_wait_ms"
+    documentation: "Cache load per-shard time spent in backend_->Wait() for owner shards that require backend IO (ms). Only recorded when backendTaskHandle != 0, i.e. Owner() && !Ready()."
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
+  - name: "cache_xfer_wake_duration_ms"
+    documentation: "Cache load per-shard time from running_.Push in ucm_load_disp to TransferOneTask entry in ucm_load_xfer (ms). Measures xfer thread wake-up and queue hand-off latency."
+    buckets: [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100]
   - name: "cache_h2d_submit_ms"
     documentation: "Cache load per-shard H2D async submit CPU cost after backend wait (ms). Submission only; NOT the actual transfer time (see cache_h2d_sync_ms)."
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500]
@@ -461,6 +476,12 @@ histogram:
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
   - name: "posix_dump_queue_wait_duration_ms"
     documentation: "Time a Posix dump task spent queued before first worker pickup (ms)"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "posix_load_push_duration_ms"
+    documentation: "Time a Posix load task spent in queue_.Push (ms), i.e. enqueuing into the load ThreadPool"
+    buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
+  - name: "posix_dump_push_duration_ms"
+    documentation: "Time a Posix dump task spent in queue_.Push (ms), i.e. enqueuing into the dump ThreadPool"
     buckets: [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500]
 
   # -- Mooncake stage -------------------------------------------------------

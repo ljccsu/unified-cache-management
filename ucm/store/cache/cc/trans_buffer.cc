@@ -51,7 +51,7 @@ static inline size_t Hash(const Detail::BlockId& blockId, size_t shard)
 struct BufferMetaNode {
     Detail::BlockId block;
     size_t shard;
-    size_t reference;
+    std::atomic<size_t> reference;
     size_t hash;
     size_t prev;
     size_t next;
@@ -59,7 +59,7 @@ struct BufferMetaNode {
     std::atomic<int32_t> errorCode;
     void Init()
     {
-        reference = 0;
+        reference.store(0, std::memory_order_relaxed);
         hash = invalidIndex;
         prev = invalidIndex;
         next = invalidIndex;
@@ -67,6 +67,7 @@ struct BufferMetaNode {
         errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
     }
 };
+static_assert(std::atomic<size_t>::is_always_lock_free, "reference must be lock-free");
 static_assert(std::atomic<TransBuffer::State>::is_always_lock_free, "state must be lock-free");
 static_assert(std::atomic<int32_t>::is_always_lock_free, "errorCode must be lock-free");
 
@@ -99,6 +100,7 @@ public:
     virtual size_t SegmentAt(size_t iNode) const = 0;
     virtual BufferMetaNode* MetaAt(size_t iNode) = 0;
     virtual void MarkAccessed(size_t iNode) = 0;
+    virtual std::atomic<uint64_t>& BucketVersion(size_t iBucket) = 0;
 };
 
 class LocalBufferStrategy : public BufferStrategy {
@@ -138,6 +140,7 @@ class LocalBufferStrategy : public BufferStrategy {
     bool mapHostToDevice_{false};
     BufferHeader header_;
     LocalMutex bucketLocks_[nHashTableBucket];
+    std::atomic<uint64_t> bucketVersions_[nHashTableBucket];
     std::unique_ptr<LocalLock[]> nodeLocks_;
     std::unique_ptr<BufferMetaNode[]> meta_;
     std::unique_ptr<std::atomic<uint8_t>[]> accessed_;
@@ -167,7 +170,10 @@ public:
             nodeLocks_ = std::make_unique<LocalLock[]>(nNode);
             meta_ = std::make_unique<BufferMetaNode[]>(nNode);
             accessed_ = std::make_unique<std::atomic<uint8_t>[]>(nNode);
-            for (size_t i = 0; i < nHashTableBucket; i++) { bucketLocks_[i].Init(); }
+            for (size_t i = 0; i < nHashTableBucket; i++) {
+                bucketLocks_[i].Init();
+                bucketVersions_[i].store(0, std::memory_order_relaxed);
+            }
             for (size_t i = 0; i < nNode; i++) {
                 nodeLocks_[i].Init();
                 accessed_[i].store(0, std::memory_order_relaxed);
@@ -238,6 +244,8 @@ public:
     }
     void MarkAccessed(size_t iNode) override
     { accessed_[iNode].store(1, std::memory_order_relaxed); }
+    std::atomic<uint64_t>& BucketVersion(size_t iBucket) override
+    { return bucketVersions_[iBucket]; }
     void* DataAt(size_t iNode) override
     { return ((std::byte*)data_.get()) + header_.nodeSize * iNode; }
     void* DeviceDataAt(size_t iNode) override
@@ -289,10 +297,12 @@ protected:
         char nodeCursorPad[64 - sizeof(std::atomic<size_t>)];
         size_t buckets[nHashTableBucket];
         ShareMutex bucketLocks[nHashTableBucket];
+        std::atomic<uint64_t> bucketVersions[nHashTableBucket];
         ShareLock nodeLocks[0];
     };
     static_assert(std::atomic<size_t>::is_always_lock_free, "nodeCursor must be lock-free");
     static_assert(std::atomic<uint8_t>::is_always_lock_free, "accessed must be lock-free");
+    static_assert(std::atomic<uint64_t>::is_always_lock_free, "bucketVersion must be lock-free");
 
     BufferHeader* header_{nullptr};
     BufferMetaNode* meta_{nullptr};
@@ -461,6 +471,7 @@ protected:
         for (size_t i = 0; i < nHashTableBucket; i++) {
             header_->buckets[i] = invalidIndex;
             header_->bucketLocks[i].Init();
+            header_->bucketVersions[i].store(0, std::memory_order_relaxed);
         }
         for (size_t i = 0; i < nNode_; i++) {
             header_->nodeLocks[i].Init();
@@ -582,6 +593,8 @@ public:
     }
     void MarkAccessed(size_t iNode) override
     { accessed_[iNode].store(1, std::memory_order_relaxed); }
+    std::atomic<uint64_t>& BucketVersion(size_t iBucket) override
+    { return header_->bucketVersions[iBucket]; }
     void* DataAt(size_t iNode) override { return data_ + nodeSize_ * iNode; }
     void* DeviceDataAt(size_t iNode) override { return dataOnDevice_ + nodeSize_ * iNode; }
     size_t SegmentAt(size_t /*iNode*/) const override { return 0; }
@@ -971,6 +984,23 @@ TransBuffer::Handle TransBuffer::Get(const Detail::BlockId& blockId, size_t shar
 {
     auto iBucket = Hash(blockId, shardIdx);
     bool owner = false;
+    constexpr size_t maxOptimisticRetry = 3;
+    for (size_t retry = 0; retry < maxOptimisticRetry; ++retry) {
+        auto& version = strategy_->BucketVersion(iBucket);
+        auto v1 = version.load(std::memory_order_acquire);
+        auto iNode = FindAt(iBucket, blockId, shardIdx, owner);
+        auto v2 = version.load(std::memory_order_acquire);
+        if (v1 == v2) {
+            if (iNode != invalidIndex) {
+                if (bypassHitOnLoad_ && isLoad && owner && Ready(iNode)) { MarkNotReady(iNode); }
+                return Handle{this, iNode, owner};
+            }
+            break;
+        }
+        if (iNode != invalidIndex) {
+            strategy_->MetaAt(iNode)->reference.fetch_sub(1, std::memory_order_acq_rel);
+        }
+    }
     strategy_->BucketLock(iBucket);
     auto iNode = FindAt(iBucket, blockId, shardIdx, owner);
     if (iNode != invalidIndex) {
@@ -998,6 +1028,14 @@ void TransBuffer::Prealloc(const Detail::BlockId& blockId, size_t shardIdx, bool
 bool TransBuffer::Exist(const Detail::BlockId& blockId, size_t shardIdx)
 {
     auto iBucket = Hash(blockId, shardIdx);
+    constexpr size_t maxOptimisticRetry = 3;
+    for (size_t retry = 0; retry < maxOptimisticRetry; ++retry) {
+        auto& version = strategy_->BucketVersion(iBucket);
+        auto v1 = version.load(std::memory_order_acquire);
+        auto exist = ExistAt(iBucket, blockId, shardIdx);
+        auto v2 = version.load(std::memory_order_acquire);
+        if (v1 == v2) { return exist; }
+    }
     strategy_->BucketLock(iBucket);
     auto exist = ExistAt(iBucket, blockId, shardIdx);
     strategy_->BucketUnlock(iBucket);
@@ -1022,15 +1060,13 @@ size_t TransBuffer::FindAt(size_t iBucket, const Detail::BlockId& blockId, size_
     while (iNode != invalidIndex) {
         auto meta = strategy_->MetaAt(iNode);
         if (meta->block == blockId && meta->shard == shardIdx) {
-            strategy_->NodeLock(iNode);
-            owner = meta->reference == 0;
-            if (owner && meta->state.load(std::memory_order_relaxed) == State::FAILED) {
-                meta->state.store(State::LOADING, std::memory_order_relaxed);
-                meta->errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
+            auto prevRef = meta->reference.fetch_add(1, std::memory_order_acq_rel);
+            owner = (prevRef == 0);
+            if (owner && meta->state.load(std::memory_order_acquire) == State::FAILED) {
+                meta->state.store(State::LOADING, std::memory_order_release);
+                meta->errorCode.store(Status::OK().Underlying(), std::memory_order_release);
             }
-            ++meta->reference;
             strategy_->MarkAccessed(iNode);
-            strategy_->NodeUnlock(iNode);
             break;
         }
         iNode = meta->next;
@@ -1046,29 +1082,34 @@ size_t TransBuffer::Alloc(const Detail::BlockId& blockId, size_t shardIdx, size_
         auto iNode = strategy_->FetchNode(allowReserved, preferredSegment, attempt++);
         auto meta = strategy_->MetaAt(iNode);
         strategy_->NodeLock(iNode);
-        if (meta->reference > 0) {
+        if (meta->reference.load(std::memory_order_relaxed) > 0) {
             strategy_->NodeUnlock(iNode);
             continue;
         }
         const auto oldBucket = meta->hash;
-        if (oldBucket != iBucket) {
-            if (oldBucket != invalidIndex) {
+        if (oldBucket != invalidIndex) {
+            if (oldBucket != iBucket) {
                 if (!strategy_->BucketTryLock(oldBucket)) {
                     strategy_->NodeUnlock(iNode);
                     continue;
                 }
                 Remove(oldBucket, iNode);
                 strategy_->BucketUnlock(oldBucket);
+            } else {
+                Remove(iBucket, iNode);
             }
-            MoveTo(iBucket, iNode);
+            strategy_->BucketVersion(oldBucket).fetch_add(2, std::memory_order_release);
         }
-        ++meta->reference;
-        strategy_->MarkAccessed(iNode);
         meta->block = blockId;
         meta->shard = shardIdx;
+        std::atomic_thread_fence(std::memory_order_release);
+        MoveTo(iBucket, iNode);
+        meta->reference.fetch_add(1, std::memory_order_relaxed);
+        strategy_->MarkAccessed(iNode);
         meta->state.store(State::LOADING, std::memory_order_relaxed);
         meta->errorCode.store(Status::OK().Underlying(), std::memory_order_relaxed);
         strategy_->NodeUnlock(iNode);
+        strategy_->BucketVersion(iBucket).fetch_add(2, std::memory_order_release);
         return iNode;
     }
 }
@@ -1120,14 +1161,14 @@ size_t TransBuffer::SegmentAt(Index pos) const { return strategy_->SegmentAt(pos
 void TransBuffer::Acquire(Index pos)
 {
     strategy_->NodeLock(pos);
-    ++strategy_->MetaAt(pos)->reference;
+    strategy_->MetaAt(pos)->reference.fetch_add(1, std::memory_order_relaxed);
     strategy_->NodeUnlock(pos);
 }
 
 void TransBuffer::Release(Index pos)
 {
     strategy_->NodeLock(pos);
-    --strategy_->MetaAt(pos)->reference;
+    strategy_->MetaAt(pos)->reference.fetch_sub(1, std::memory_order_relaxed);
     strategy_->NodeUnlock(pos);
 }
 

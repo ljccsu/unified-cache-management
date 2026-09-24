@@ -26,6 +26,9 @@
 #include "metrics_api.h"
 #include "thread/cpu_affinity.h"
 
+#include <algorithm>
+#include <cmath>
+
 namespace UC::CacheStore {
 
 LoadQueue::~LoadQueue()
@@ -91,12 +94,17 @@ static std::vector<size_t> RearrangeIndex(size_t n, size_t iProc, size_t nProc)
 {
     std::vector<size_t> order;
     order.reserve(n);
-    for (size_t r = 0; r < nProc; ++r) {
-        size_t slice = (iProc + r) % nProc;
-        for (size_t j = 0;; ++j) {
-            size_t i = slice + j * nProc;
-            if (i >= n) { break; }
-            order.push_back(i);
+    if (nProc <= 1 || n == 0) {
+        for (size_t i = 0; i < n; ++i) { order.push_back(i); }
+        return order;
+    }
+    size_t groupSize = std::max(n / nProc, static_cast<size_t>(1));
+    size_t nGroups = (n + groupSize - 1) / groupSize;
+    for (size_t r = 0; r < nGroups; ++r) {
+        size_t group = (iProc + r) % nGroups;
+        for (size_t j = 0; j < groupSize; ++j) {
+            size_t i = group * groupSize + j;
+            if (i < n) { order.push_back(i); }
         }
     }
     return order;
@@ -115,7 +123,33 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
     const auto nShard = task->desc.size();
     size_t backendSubmitCount = 0;
     size_t waitShardCount = 0;
+    double bufferGetDurationMs = 0.0;
+    double backendLoadDurationMs = 0.0;
     const auto indexes = RearrangeIndex(nShard, bufferRank_, localRankSize_);
+/*    static std::atomic<bool> shardDistLogged{false};
+    if (!shardDistLogged.exchange(true)) {
+        size_t minIdx = indexes[0], maxIdx = indexes[0];
+        double sum = 0;
+        for (size_t i = 0; i < nShard; ++i) {
+            minIdx = std::min(minIdx, indexes[i]);
+            maxIdx = std::max(maxIdx, indexes[i]);
+            sum += indexes[i];
+        }
+        double mean = sum / nShard;
+        double var = 0;
+        for (size_t i = 0; i < nShard; ++i) {
+            double d = indexes[i] - mean;
+            var += d * d;
+        }
+        double stddev = std::sqrt(var / nShard);
+        UC_INFO_UNLIMITED("Shard distribution: rank={}, nShard={}, localRankSize={}, groupSize={}, "
+                "indexes[0..3]={},{},{},{}, min={}, max={}, mean={:.1f}, stddev={:.1f}",
+                deviceId_, nShard, localRankSize_,
+                std::max(nShard / localRankSize_, static_cast<size_t>(1)),
+                indexes[0], indexes[1 % nShard], indexes[2 % nShard], indexes[3 % nShard],
+                minIdx, maxIdx, mean, stddev);
+    }
+*/
     struct PreallocHint {
         Detail::BlockId block;
         size_t shard;
@@ -127,6 +161,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         const auto originalIndex = indexes[i];
         auto& shard = task->desc[originalIndex];
         ShardTask shardTask;
+        auto tpGetStart = NowTime::Now();
         if (rankStriped_) {
             const auto preferredSegment = originalIndex % localRankSize_;
             shardTask.bufferHandle =
@@ -134,6 +169,7 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         } else {
             shardTask.bufferHandle = buffer_->Get(shard.owner, shard.index, true, true);
         }
+        bufferGetDurationMs += (NowTime::Now() - tpGetStart) * 1e3;
         shardTask.backendTaskHandle = 0;
         shardTask.fromPosix = !shardTask.bufferHandle.Ready();
         if (shardTask.fromPosix) { waitShardCount++; }
@@ -142,7 +178,9 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                 Detail::Shard{shard.owner, shard.index, {shardTask.bufferHandle.Data()}}
             };
             backendTask.brief = "Backend2Cache";
+            auto tpLoadStart = NowTime::Now();
             auto res = backend_->Load(std::move(backendTask));
+            backendLoadDurationMs += (NowTime::Now() - tpLoadStart) * 1e3;
             if (!res) [[unlikely]] {
                 UC_ERROR("Failed({}) to submit load task({}) to backend.", res.Error(), task->id);
                 UC::Metrics::UpdateStats(
@@ -165,9 +203,11 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         shardTask.task = task;
         shardTask.shard = std::move(shard);
         shardTask.waiter = (i + 1 < nShard) ? nullptr : waiter;
+        shardTask.dispatchTp = NowTime::Now();
         running_.Push(std::move(shardTask));
     }
     auto tpDispatch = NowTime::Now();
+    if (backendSubmitCount > 0) { task->backendSubmitTp = tpDispatch; }
     for (const auto& hint : preallocHints) {
         if (rankStriped_) {
             buffer_->Prealloc(hint.block, hint.shard, true, hint.segment);
@@ -183,6 +223,10 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
                              (tpDispatch - tpWait) * 1e3);
     UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_shards_total"),
                              static_cast<double>(backendSubmitCount));
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_buffer_get_duration_ms"),
+                             bufferGetDurationMs);
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_load_backend_load_duration_ms"),
+                             backendLoadDurationMs);
     RecordLoadSourceShards(nShard, waitShardCount);
 }
 
@@ -210,6 +254,8 @@ void LoadQueue::TransferStage(std::promise<Status>& started)
 
 void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 {
+    UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_xfer_wake_duration_ms"),
+                             (NowTime::Now() - task.dispatchTp) * 1e3);
     auto parentTask = task.task;
     const auto taskHandle = parentTask->id;
     if (failureSet_->Contains(taskHandle)) {
@@ -237,6 +283,10 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
         auto tpBackendReady = NowTime::Now();
         UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_wait_ms"),
                                  (tpBackendReady - tpBackendWait) * 1e3);
+        if (waiter && parentTask->backendSubmitTp > 0) {
+            UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("posix_load_duration_ms"),
+                                     (tpBackendReady - parentTask->backendSubmitTp) * 1e3);
+        }
 
         auto* host = cacheSdmaDirect_ ? task.bufferHandle.DeviceData() : task.bufferHandle.Data();
         s = HostToDeviceAsync(stream, host, task.shard.addrs.data());
@@ -281,7 +331,10 @@ void LoadQueue::TransferOneTask(CopyStream& stream, ShardTask&& task)
 Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
 {
     if (task.backendTaskHandle != 0) {
+        auto tpWaitStart = NowTime::Now();
         auto s = backend_->Wait(task.backendTaskHandle);
+        UC::Metrics::UpdateStats(NAME_TO_METRIC_ID("cache_shard_backend_io_wait_ms"),
+                                 (NowTime::Now() - tpWaitStart) * 1e3);
         if (s.Failure()) [[unlikely]] {
             UC_ERROR("Failed({}) to wait backend({}) for task({}).", s, task.backendTaskHandle,
                      task.task->id);

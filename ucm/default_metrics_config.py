@@ -734,12 +734,57 @@ _HISTOGRAM_METRICS = [
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (
+        "cache_load_buffer_get_duration_ms",
+        (
+            "Cache load buffer Get duration: total time spent in buffer_->Get() across "
+            "all shards in one dispatch task (ms). Sub-component of "
+            "cache_load_backend_submit_duration_ms."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "cache_load_backend_load_duration_ms",
+        (
+            "Cache load backend Load duration: total time spent in backend_->Load() "
+            "across all shards in one dispatch task (ms). Sub-component of "
+            "cache_load_backend_submit_duration_ms; zero when all shards hit the buffer."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
         "cache_shard_backend_wait_ms",
         (
             "Cache load per-shard time spent in WaitBackendTaskReady before H2D submit "
             "(ms). This is not a task-level duration."
         ),
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "posix_load_duration_ms",
+        (
+            "Cache load per-layer wall-clock time from all backend Load submissions done "
+            "to the last shard backend IO ready (ms). Cross-thread ucm_load_disp -> "
+            "ucm_load_xfer; only recorded when at least one shard hit backend."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_shard_backend_io_wait_ms",
+        (
+            "Cache load per-shard time spent in backend_->Wait() for owner shards "
+            "that require backend IO (ms). Only recorded when backendTaskHandle != 0, "
+            "i.e. Owner() && !Ready()."
+        ),
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 200, 500],
+    ),
+    (
+        "cache_xfer_wake_duration_ms",
+        (
+            "Cache load per-shard time from running_.Push in ucm_load_disp to "
+            "TransferOneTask entry in ucm_load_xfer (ms). Measures xfer thread "
+            "wake-up and queue hand-off latency."
+        ),
+        [0.01, 0.05, 0.1, 0.5, 1, 2, 5, 10, 20, 50, 100],
     ),
     (
         "cache_h2d_submit_ms",
@@ -834,6 +879,16 @@ _HISTOGRAM_METRICS = [
     (
         "posix_dump_queue_wait_duration_ms",
         "Time a Posix dump task spent queued before first worker pickup (ms)",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "posix_load_push_duration_ms",
+        "Time a Posix load task spent in queue_.Push (ms), i.e. enqueuing into the load ThreadPool",
+        [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
+    ),
+    (
+        "posix_dump_push_duration_ms",
+        "Time a Posix dump task spent in queue_.Push (ms), i.e. enqueuing into the dump ThreadPool",
         [0.1, 0.5, 1, 2, 5, 10, 20, 50, 100, 500],
     ),
     (

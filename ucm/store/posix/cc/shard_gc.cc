@@ -128,7 +128,7 @@ void ShardGarbageCollector::GCCheckLoop()
 void ShardGarbageCollector::RunGcCycle()
 {
     auto [trigger, avgFilesPerShard, threshold] = ShouldTrigger();
-    UC_INFO("GC sampling: avgFiles/shard={}, threshold={}, trigger={}", avgFilesPerShard, threshold,
+    UC_INFO("9.2.GC sampling: avgFiles/shard={}, threshold={}, trigger={}", avgFilesPerShard, threshold,
             trigger);
     int rounds = 0;
     const bool gcRunning = trigger;
