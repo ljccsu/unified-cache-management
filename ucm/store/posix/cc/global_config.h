@@ -35,7 +35,7 @@ struct Config {
     size_t tensorSize{0};
     size_t shardSize{0};
     size_t blockSize{0};
-    std::string ioEngine{"psync"};  // "aio", "psync", "iouring"
+    std::string ioEngine{"psync"};  // "aio", "psync"
     bool ioDirect{true};
     std::vector<ssize_t> cpuAffinityCores{};
     size_t dataTransConcurrency{128};

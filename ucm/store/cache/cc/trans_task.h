@@ -41,7 +41,6 @@ public:
     Type type{Type::DUMP};
     Detail::TaskDesc desc;
     std::atomic<int32_t> failureStatus{Status::OK().Underlying()};
-    double backendSubmitTp{0.0};
 
 public:
     TransTask(Type type, Detail::TaskDesc desc) : id{NextId()}, type{type}, desc{std::move(desc)} {}
@@ -49,8 +48,7 @@ public:
         : id{other.id},
           type{other.type},
           desc{std::move(other.desc)},
-          failureStatus{other.failureStatus.load()},
-          backendSubmitTp{other.backendSubmitTp}
+          failureStatus{other.failureStatus.load()}
     {
     }
     void Fail(const Status& status)

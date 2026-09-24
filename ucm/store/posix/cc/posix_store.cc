@@ -305,9 +305,9 @@ private:
             return Status::InvalidParam("invalid size({},{},{})", config.tensorSize,
                                         config.shardSize, config.blockSize);
         }
-        if (config.ioEngine == "aio" || config.ioEngine == "iouring") {
+        if (config.ioEngine == "aio") {
             if (config.openConcurrency == 0 || config.commitConcurrency == 0) {
-                return Status::InvalidParam("invalid {} concurrency({},{})", config.ioEngine,
+                return Status::InvalidParam("invalid aio concurrency({},{})",
                                             config.openConcurrency, config.commitConcurrency);
             }
         } else if (config.ioEngine == "psync") {

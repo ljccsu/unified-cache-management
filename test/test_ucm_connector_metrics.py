@@ -2826,44 +2826,26 @@ def test_pipeline_dashboard_orders_cache_bandwidth_rows():
         "x": 12,
         "y": 49,
     }
-    assert panels["Cache Load Backend IO Wait Duration"]["gridPos"] == {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 57,
-    }
-    assert panels["Posix Load Duration"]["gridPos"] == {
-        "h": 8,
-        "w": 12,
-        "x": 12,
-        "y": 57,
-    }
-    assert panels["Cache Load Xfer Wake Duration"]["gridPos"] == {
-        "h": 8,
-        "w": 12,
-        "x": 0,
-        "y": 65,
-    }
-    assert panels["Cache Load H2D Duration"]["gridPos"]["y"] == 81
+    assert panels["Cache Load H2D Duration"]["gridPos"]["y"] == 57
     assert "Cache Dump D2H Duration (include wait compute)" in panels
     assert "Cache Dump D2H Duration" not in panels
     assert panels["Cache Lookup Duration"]["gridPos"] == {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 105,
+        "y": 81,
     }
     assert panels["Cache Dump Backend Wait Duration"]["gridPos"] == {
         "h": 8,
         "w": 12,
         "x": 12,
-        "y": 105,
+        "y": 81,
     }
     assert panels["Cache Lookup Backend Duration"]["gridPos"] == {
         "h": 8,
         "w": 12,
         "x": 0,
-        "y": 113,
+        "y": 89,
     }
 
 

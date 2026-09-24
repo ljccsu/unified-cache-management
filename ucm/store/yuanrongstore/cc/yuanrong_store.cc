@@ -401,16 +401,13 @@ private:
                                         config.posixMaxInflightGb);
         }
         if (config.storeBackend != nullptr && config.posixIoEngine != "psync" &&
-            config.posixIoEngine != "aio" && config.posixIoEngine != "iouring") {
+            config.posixIoEngine != "aio") {
             return Status::InvalidParam("invalid posix_io_engine({}) for YuanRong|Posix",
                                         config.posixIoEngine);
         }
-        if (config.storeBackend != nullptr &&
-            (config.posixIoEngine == "aio" || config.posixIoEngine == "iouring") &&
-            !config.ioDirect) {
+        if (config.storeBackend != nullptr && config.posixIoEngine == "aio" && !config.ioDirect) {
             return Status::InvalidParam(
-                "YuanRong|Posix posix_io_engine={} requires io_direct=true",
-                config.posixIoEngine);
+                "YuanRong|Posix posix_io_engine=aio requires io_direct=true");
         }
         if (config.deviceId < 0) { return Status::OK(); }
         if (config.gpuKvBufferAddrs.size() != config.gpuKvBufferSizes.size()) {
