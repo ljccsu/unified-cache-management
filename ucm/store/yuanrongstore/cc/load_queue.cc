@@ -29,6 +29,7 @@
 #include <future>
 #include "logger/logger.h"
 #include "metrics_api.h"
+#include "thread/backoff.h"
 #ifdef __linux__
 #include "thread/cpu_affinity.h"
 #endif
@@ -145,13 +146,15 @@ void LoadQueue::DispatchOneTask(TaskPair&& pair)
         return;
     }
     const auto workerCount = running_.size();
+    Backoff backoff;
     for (size_t i = 0; !stop_.load(std::memory_order_acquire); ++i) {
         auto index = (nextWorker_ + i) % workerCount;
         if (running_[index]->TryPush(std::move(pair))) {
             nextWorker_ = (index + 1) % workerCount;
             return;
         }
-        std::this_thread::yield();
+        // Only back off after every worker queue has been tried once.
+        if ((i + 1) % workerCount == 0) { backoff.Pause(); }
     }
     failureSet_->Insert(pair.first->id);
     pair.second->Done();

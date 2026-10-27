@@ -24,6 +24,7 @@
 #include "load_queue.h"
 #include "logger/logger.h"
 #include "metrics_api.h"
+#include "thread/backoff.h"
 #include "thread/cpu_affinity.h"
 
 namespace UC::CacheStore {
@@ -261,12 +262,14 @@ Status LoadQueue::WaitBackendTaskReady(ShardTask& task)
         task.bufferHandle.MarkReady();
         return Status::OK();
     }
+    // Another rank owns this shard; its backend load can take milliseconds on NFS.
+    Backoff backoff;
     for (;;) {
         auto state = task.bufferHandle.GetState();
         if (state == TransBuffer::State::READY) { return Status::OK(); }
         if (state == TransBuffer::State::FAILED) { return task.bufferHandle.FailureStatus(); }
         if (failureSet_->Contains(task.task->id)) { return task.task->FailureStatus(); }
-        std::this_thread::yield();
+        backoff.Pause();
     }
 }
 

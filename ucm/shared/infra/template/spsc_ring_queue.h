@@ -30,6 +30,7 @@
 #include <functional>
 #include <memory>
 #include <thread>
+#include "thread/backoff.h"
 
 namespace UC {
 
@@ -55,6 +56,7 @@ public:
 
     void Push(T&& value)
     {
+        Backoff backoff;
         while (true) {
             const size_t currentHead = head_.load(std::memory_order_relaxed);
             const size_t nextHead = Mod(currentHead + 1);
@@ -63,7 +65,7 @@ public:
                 head_.store(nextHead, std::memory_order_release);
                 return;
             }
-            std::this_thread::yield();
+            backoff.Pause();
         }
     }
 

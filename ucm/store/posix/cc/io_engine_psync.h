@@ -30,6 +30,7 @@
 #include "metrics_api.h"
 #include "template/spsc_ring_queue.h"
 #include "template/task_wrapper.h"
+#include "thread/backoff.h"
 #include "thread/cpu_affinity.h"
 #include "thread/lock.h"
 #include "trans_queue.h"
@@ -80,15 +81,19 @@ protected:
         }
         w->Up();
         bool pushed = false;
-        {
-            SpinLockGuard guard(pushLock_);
-            while (!stop_.load(std::memory_order_acquire)) {
+        // Release pushLock_ between attempts so other submitters do not spin on it while the
+        // queue stays full; stop_ is still checked under the lock to keep Close() draining safe.
+        Backoff backoff;
+        for (;;) {
+            {
+                SpinLockGuard guard(pushLock_);
+                if (stop_.load(std::memory_order_acquire)) { break; }
                 if (waiting_.TryPush({t, w})) {
                     pushed = true;
                     break;
                 }
-                std::this_thread::yield();
             }
+            backoff.Pause();
         }
         if (!pushed) [[unlikely]] {
             UC_ERROR("Posix load task({}) dispatch aborted, engine stopped.", t->id);
